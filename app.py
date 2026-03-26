@@ -19,6 +19,16 @@ GOOGLE_CREDENTIALS_JSON = os.environ.get("GOOGLE_CREDENTIALS_JSON")
 GDRIVE_FOLDER_ID = "1dnw0pgk4JeXLENzpGgUYV4a_IoUtxPrU"
 NUMEROS_AUTORIZADOS = os.environ.get("NUMEROS_AUTORIZADOS", "").split(",")
 
+MIME_TYPES = {
+    "jpg": "image/jpeg",
+    "jpeg": "image/jpeg",
+    "png": "image/png",
+    "pdf": "application/pdf",
+    "txt": "text/plain",
+    "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+}
+
 
 def get_drive_service():
     creds_dict = json.loads(GOOGLE_CREDENTIALS_JSON)
@@ -29,7 +39,7 @@ def get_drive_service():
     return build("drive", "v3", credentials=creds)
 
 
-def subir_a_drive(nombre_archivo, contenido):
+def subir_texto_a_drive(nombre_archivo, contenido):
     service = get_drive_service()
     media = MediaInMemoryUpload(contenido.encode("utf-8"), mimetype="text/plain")
     file_metadata = {
@@ -42,6 +52,29 @@ def subir_a_drive(nombre_archivo, contenido):
         supportsAllDrives=True,
         fields="id"
     ).execute()
+
+
+def subir_binario_a_drive(nombre_archivo, contenido_bytes, mimetype):
+    service = get_drive_service()
+    media = MediaInMemoryUpload(contenido_bytes, mimetype=mimetype)
+    file_metadata = {
+        "name": nombre_archivo,
+        "parents": [GDRIVE_FOLDER_ID]
+    }
+    service.files().create(
+        body=file_metadata,
+        media_body=media,
+        supportsAllDrives=True,
+        fields="id"
+    ).execute()
+
+
+def descargar_archivo_twilio(url):
+    response = req.get(
+        url,
+        auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+    )
+    return response.content, response.headers.get("Content-Type", "application/octet-stream")
 
 
 def interpretar_mensaje(mensaje, remitente):
@@ -138,7 +171,9 @@ def respuesta_comando(comando):
             "MGB 5000 efectivo\n"
             "o: egreso - MGB - 5000 - transferencia\n\n"
             "Para registrar un ingreso:\n"
-            "ingreso - servicio del dia - 50000 - nave"
+            "ingreso - servicio del dia - 50000 - nave\n\n"
+            "Para enviar archivos:\n"
+            "Manda la foto o PDF directamente"
         ),
         "/saldo": "Para consultar el saldo, Claude lo procesara en el proximo ciclo de Cowork.",
         "/reporte": "Para generar el reporte, Claude lo procesara en el proximo ciclo de Cowork.",
@@ -151,34 +186,80 @@ def respuesta_comando(comando):
 def webhook():
     incoming_msg = request.values.get("Body", "").strip()
     remitente = request.values.get("From", "").replace("whatsapp:", "")
+    num_media = int(request.values.get("NumMedia", 0))
+
     resp = MessagingResponse()
     msg = resp.message()
+
     if NUMEROS_AUTORIZADOS and remitente not in NUMEROS_AUTORIZADOS:
         msg.body("No estas autorizado para usar este bot.")
         return str(resp)
-    if not incoming_msg:
-        msg.body("Mensaje vacio. Escribi /ayuda.")
-        return str(resp)
+
     try:
+        # CASO 1: Hay archivos adjuntos
+        if num_media > 0:
+            archivos_guardados = []
+            ahora = datetime.now().strftime("%d%m%Y_%H%M%S")
+
+            for i in range(num_media):
+                media_url = request.values.get(f"MediaUrl{i}")
+                media_type = request.values.get(f"MediaContentType{i}", "")
+
+                # Determinar extensión
+                if "pdf" in media_type:
+                    ext = "pdf"
+                elif "jpeg" in media_type or "jpg" in media_type:
+                    ext = "jpg"
+                elif "png" in media_type:
+                    ext = "png"
+                else:
+                    ext = "bin"
+
+                nombre_archivo = f"ARCHIVO_{ahora}_{i+1}.{ext}"
+
+                # Si hay texto adjunto al archivo, incluirlo como nombre descriptivo
+                if incoming_msg:
+                    texto_limpio = incoming_msg[:30].replace(" ", "_").replace("/", "-")
+                    nombre_archivo = f"ARCHIVO_{texto_limpio}_{ahora}_{i+1}.{ext}"
+
+                # Descargar y subir a Drive
+                contenido_bytes, mimetype = descargar_archivo_twilio(media_url)
+                subir_binario_a_drive(nombre_archivo, contenido_bytes, mimetype)
+                archivos_guardados.append(nombre_archivo)
+
+            msg.body(f"📁 {len(archivos_guardados)} archivo(s) guardado(s) en carpeta Para Claude:\n" + "\n".join(archivos_guardados))
+            return str(resp)
+
+        # CASO 2: Solo texto
+        if not incoming_msg:
+            msg.body("Mensaje vacio. Escribi /ayuda.")
+            return str(resp)
+
         datos = interpretar_mensaje(incoming_msg, remitente)
+
         if datos["tipo"] == "comando":
             msg.body(respuesta_comando(datos.get("comando", "/ayuda")))
             return str(resp)
+
         if datos.get("es_interno"):
             msg.body("Transferencia interna - no se registra.")
             return str(resp)
+
         if datos["tipo"] == "error":
             msg.body(f"No pude interpretar: {datos.get('error', 'dato faltante')}. Escribi /ayuda.")
             return str(resp)
+
         nombre_archivo, contenido = generar_archivo_registro(datos, remitente)
-        subir_a_drive(nombre_archivo, contenido)
+        subir_texto_a_drive(nombre_archivo, contenido)
         emoji = "💸" if datos["tipo"] == "egreso" else "💰"
         confirmacion = datos.get("confirmacion") or "Registrado correctamente."
         msg.body(f"{emoji} {confirmacion}\n\nGuardado en carpeta Para Claude.")
+
     except json.JSONDecodeError:
         msg.body("Error interpretando el mensaje. Intenta de nuevo o escribi /ayuda.")
     except Exception as e:
         msg.body(f"Error: {str(e)[:500]}")
+
     return str(resp)
 
 
