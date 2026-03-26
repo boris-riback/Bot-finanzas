@@ -178,7 +178,7 @@ def webhook():
     except json.JSONDecodeError:
         msg.body("Error interpretando el mensaje. Intenta de nuevo o escribi /ayuda.")
     except Exception as e:
-        msg.body(f"Error: {str(e)[:150]}")
+        msg.body(f"Error: {str(e)[:500]}")
     return str(resp)
 
 
