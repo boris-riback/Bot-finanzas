@@ -8,7 +8,7 @@ from twilio.rest import Client
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaInMemoryUpload
-import anthropic
+import requests as req
 
 app = Flask(__name__)
 
@@ -43,8 +43,12 @@ def subir_a_drive(nombre_archivo, contenido):
 
 # ─── CLAUDE API ───────────────────────────────────────────────
 def interpretar_mensaje(mensaje, remitente):
-    client = anthropic.Anthropic()
-    
+    def interpretar_mensaje(mensaje, remitente):
+    headers = {
+        "x-api-key": ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json"
+    }
     prompt = f"""Sos un asistente financiero para un negocio gastronómico en Argentina (bar, fábrica de cerveza, beer truck).
 
 Tu tarea es interpretar mensajes de WhatsApp y extraer datos financieros.
@@ -55,10 +59,6 @@ El mensaje puede ser:
 3. Un COMANDO: /saldo, /reporte, /pendientes, /ayuda
 
 Medios de pago válidos: Efectivo, Transferencia, MercadoPago, Echeq
-
-Si el mensaje es texto libre, interpretalo de forma inteligente.
-Si es formato fijo (proveedor - monto - medio), parsealo directamente.
-Si falta algún dato clave (monto o proveedor para egreso), indicalo.
 
 Respondé SOLO en JSON con esta estructura:
 {{
@@ -78,14 +78,13 @@ Fecha de hoy: {datetime.now().strftime('%d-%m-%Y')}
 Mensaje: {mensaje}
 Remitente: {remitente}"""
 
-    response = client.messages.create(
-        model="claude-sonnet-4-20250514",
-        max_tokens=500,
-        messages=[{"role": "user", "content": prompt}]
-    )
-    
-    texto = response.content[0].text
-    # Limpiar posibles backticks
+    body = {
+        "model": "claude-sonnet-4-20250514",
+        "max_tokens": 500,
+        "messages": [{"role": "user", "content": prompt}]
+    }
+    response = req.post("https://api.anthropic.com/v1/messages", headers=headers, json=body)
+    texto = response.json()["content"][0]["text"]
     texto = re.sub(r'```json|```', '', texto).strip()
     return json.loads(texto)
 
