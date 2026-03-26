@@ -26,7 +26,11 @@ MIME_TYPES = {
     "pdf": "application/pdf",
     "txt": "text/plain",
     "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "zip": "application/zip",
+    "rar": "application/x-rar-compressed",
+    "mp4": "video/mp4",
+    "mov": "video/quicktime"
 }
 
 
@@ -210,6 +214,10 @@ def webhook():
                     ext = "pdf"
                 elif "jpeg" in media_type or "jpg" in media_type:
                     ext = "jpg"
+                elif "zip" in media_type or "x-zip" in media_type:
+                    ext = "zip"
+                elif "rar" in media_type:
+                    ext = "rar"
                 elif "png" in media_type:
                     ext = "png"
                 else:
