@@ -19,6 +19,16 @@ GOOGLE_CREDENTIALS_JSON = os.environ.get("GOOGLE_CREDENTIALS_JSON")
 GDRIVE_FOLDER_ID = "1dnw0pgk4JeXLENzpGgUYV4a_IoUtxPrU"
 NUMEROS_AUTORIZADOS = os.environ.get("NUMEROS_AUTORIZADOS", "").split(",")
 
+EXTENSIONES_ARCHIVO = [".pdf", ".jpg", ".jpeg", ".png", ".zip", ".rar", ".xlsx", ".docx", ".txt", ".mp4", ".mov"]
+
+
+def es_nombre_archivo(texto):
+    texto_lower = texto.lower()
+    for ext in EXTENSIONES_ARCHIVO:
+        if ext in texto_lower:
+            return True
+    return False
+
 
 def get_drive_service():
     creds_dict = json.loads(GOOGLE_CREDENTIALS_JSON)
@@ -71,7 +81,7 @@ def get_extension(media_type):
         return "rar"
     elif "mp4" in media_type:
         return "mp4"
-    elif "mov" in media_type or "quicktime" in media_type:
+    elif "quicktime" in media_type:
         return "mov"
     elif "text" in media_type:
         return "txt"
@@ -198,31 +208,35 @@ def webhook():
         return str(resp)
 
     try:
-        # CASO 1: Hay archivos adjuntos — procesar SIN importar el texto
+        # CASO 1: Archivos adjuntos via MediaUrl
         if num_media > 0:
             archivos_guardados = []
             ahora = datetime.now().strftime("%d%m%Y_%H%M%S")
-
             for i in range(num_media):
                 media_url = request.values.get(f"MediaUrl{i}")
                 media_type = request.values.get(f"MediaContentType{i}", "")
                 ext = get_extension(media_type)
-
-                # Nombre del archivo
-                if incoming_msg and len(incoming_msg) < 50:
+                if incoming_msg and len(incoming_msg) < 50 and not es_nombre_archivo(incoming_msg):
                     texto_limpio = incoming_msg[:30].replace(" ", "_").replace("/", "-")
                     nombre_archivo = f"ARCHIVO_{texto_limpio}_{ahora}_{i+1}.{ext}"
                 else:
                     nombre_archivo = f"ARCHIVO_{ahora}_{i+1}.{ext}"
-
                 contenido_bytes, mimetype = descargar_archivo_twilio(media_url)
                 subir_binario_a_drive(nombre_archivo, contenido_bytes, mimetype)
                 archivos_guardados.append(nombre_archivo)
-
             msg.body(f"📁 {len(archivos_guardados)} archivo(s) guardado(s) en carpeta Para Claude:\n" + "\n".join(archivos_guardados))
             return str(resp)
 
-        # CASO 2: Solo texto
+        # CASO 2: El Body parece un nombre de archivo (ZIP, PDF, etc sin MediaUrl)
+        if incoming_msg and es_nombre_archivo(incoming_msg):
+            ahora = datetime.now().strftime("%d%m%Y_%H%M%S")
+            nombre_archivo = f"ARCHIVO_{ahora}.txt"
+            contenido = f"ARCHIVO RECIBIDO: {incoming_msg}\nFECHA: {datetime.now().strftime('%d-%m-%Y %H:%M')}\nNOTA: El archivo no pudo descargarse automaticamente. Revisarlo manualmente.\n"
+            subir_texto_a_drive(nombre_archivo, contenido)
+            msg.body(f"📁 Archivo registrado: {incoming_msg}\n\nNota: el sandbox de Twilio tiene limitaciones con algunos tipos de archivo. Para enviarlo correctamente usa el numero de produccion de Twilio.")
+            return str(resp)
+
+        # CASO 3: Solo texto
         if not incoming_msg:
             msg.body("Mensaje vacio. Escribi /ayuda.")
             return str(resp)
