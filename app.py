@@ -43,7 +43,13 @@ def interpretar_mensaje(mensaje, remitente):
         "content-type": "application/json"
     }
     prompt = (
-        "Sos un asistente financiero para un negocio gastronomico en Argentina.\n"
+        "Sos un asistente financiero para un negocio gastronomico en Argentina "
+        "(bar, fabrica de cerveza artesanal, beer truck para eventos).\n\n"
+        "REGLAS IMPORTANTES:\n"
+        "- Una transferencia interna es cuando el dinero se mueve entre cuentas PROPIAS del negocio (ej: de Galicia a MercadoPago)\n"
+        "- Si el mensaje menciona un proveedor con un monto y medio de pago, SIEMPRE es un EGRESO, nunca interno\n"
+        "- Si no hay medio de pago mencionado, asumir Efectivo por defecto\n"
+        "- Comandos validos: /saldo, /reporte, /pendientes, /ayuda\n\n"
         "Interpreta el mensaje y devuelve SOLO JSON con esta estructura:\n"
         "{\n"
         '  "tipo": "egreso" o "ingreso" o "comando" o "error",\n'
@@ -56,7 +62,7 @@ def interpretar_mensaje(mensaje, remitente):
         '  "es_interno": true o false,\n'
         '  "error": "descripcion" o null,\n'
         '  "confirmacion": "texto confirmacion"\n'
-        "}\n"
+        "}\n\n"
         f"Fecha de hoy: {datetime.now().strftime('%d-%m-%Y')}\n"
         f"Mensaje: {mensaje}\n"
         f"Remitente: {remitente}"
