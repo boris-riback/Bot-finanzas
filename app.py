@@ -72,8 +72,11 @@ Remitente: {remitente}"""
         "max_tokens": 500,
         "messages": [{"role": "user", "content": prompt}]
     }
-    response = req.post("https://api.anthropic.com/v1/messages", headers=headers, json=body)
-    texto = response.json()["content"][0]["text"]
+response = req.post("https://api.anthropic.com/v1/messages", headers=headers, json=body)
+    response_json = response.json()
+    if "content" not in response_json:
+        raise Exception(f"API error: {response_json}")
+    texto = response_json["content"][0]["text"]
     texto = re.sub(r'```json|```', '', texto).strip()
     return json.loads(texto)
 
