@@ -43,7 +43,7 @@ def subir_a_drive(nombre_archivo, contenido):
 
 # ─── CLAUDE API ───────────────────────────────────────────────
 def interpretar_mensaje(mensaje, remitente):
-    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    client = anthropic.Anthropic()
     
     prompt = f"""Sos un asistente financiero para un negocio gastronómico en Argentina (bar, fábrica de cerveza, beer truck).
 
