@@ -32,8 +32,16 @@ def get_drive_service():
 def subir_a_drive(nombre_archivo, contenido):
     service = get_drive_service()
     media = MediaInMemoryUpload(contenido.encode("utf-8"), mimetype="text/plain")
-    file_metadata = {"name": nombre_archivo, "parents": [GDRIVE_FOLDER_ID]}
-    service.files().create(body=file_metadata, media_body=media).execute()
+    file_metadata = {
+        "name": nombre_archivo,
+        "parents": [GDRIVE_FOLDER_ID]
+    }
+    service.files().create(
+        body=file_metadata,
+        media_body=media,
+        supportsAllDrives=True,
+        fields="id"
+    ).execute()
 
 
 def interpretar_mensaje(mensaje, remitente):
