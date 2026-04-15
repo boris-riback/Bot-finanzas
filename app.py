@@ -1,272 +1,216 @@
-import os
+import base64
 import json
+import os
 import re
-import requests as req
 from datetime import datetime
+
+import anthropic
+import httpx
 from flask import Flask, request
 from twilio.twiml.messaging_response import MessagingResponse
-from google.oauth2 import service_account
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaInMemoryUpload
+
+from bialystok_client import fetch_catalog, ingest, upload_attachment
 
 app = Flask(__name__)
 
 TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN")
 TWILIO_WHATSAPP_NUMBER = os.environ.get("TWILIO_WHATSAPP_NUMBER")
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
-GOOGLE_CREDENTIALS_JSON = os.environ.get("GOOGLE_CREDENTIALS_JSON")
-GDRIVE_FOLDER_ID = "1dnw0pgk4JeXLENzpGgUYV4a_IoUtxPrU"
-NUMEROS_AUTORIZADOS = os.environ.get("NUMEROS_AUTORIZADOS", "").split(",")
+ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 
-EXTENSIONES_ARCHIVO = [".pdf", ".jpg", ".jpeg", ".png", ".zip", ".rar", ".xlsx", ".docx", ".txt", ".mp4", ".mov"]
+IMAGE_MIMES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
+PDF_MIMES = {"application/pdf"}
 
-
-def es_nombre_archivo(texto):
-    texto_lower = texto.lower()
-    for ext in EXTENSIONES_ARCHIVO:
-        if ext in texto_lower:
-            return True
-    return False
+claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
 
-def get_drive_service():
-    creds_dict = json.loads(GOOGLE_CREDENTIALS_JSON)
-    creds = service_account.Credentials.from_service_account_info(
-        creds_dict,
-        scopes=["https://www.googleapis.com/auth/drive"]
-    )
-    return build("drive", "v3", credentials=creds)
+def build_prompt_text(catalog: dict, body: str, has_attachment: bool) -> str:
+    today = datetime.now().strftime("%Y-%m-%d")
+    adjunto_block = ""
+    if has_attachment:
+        adjunto_block = (
+            "\nSe adjunta un comprobante (PDF o imagen). Mirá el documento y extraé:\n"
+            "- monto total (amount)\n"
+            "- fecha del comprobante (movementDate)\n"
+            "- razón social / proveedor / contraparte\n"
+            "- CUIT si está visible\n"
+            "- tipo y número de comprobante (Factura A/B/C, Recibo, Ticket, Transferencia, etc.)\n"
+            "- método de pago si está indicado\n"
+        )
 
-
-def subir_texto_a_drive(nombre_archivo, contenido):
-    service = get_drive_service()
-    media = MediaInMemoryUpload(contenido.encode("utf-8"), mimetype="text/plain")
-    file_metadata = {"name": nombre_archivo, "parents": [GDRIVE_FOLDER_ID]}
-    service.files().create(
-        body=file_metadata,
-        media_body=media,
-        supportsAllDrives=True,
-        fields="id"
-    ).execute()
-
-
-def subir_binario_a_drive(nombre_archivo, contenido_bytes, mimetype):
-    service = get_drive_service()
-    media = MediaInMemoryUpload(contenido_bytes, mimetype=mimetype)
-    file_metadata = {"name": nombre_archivo, "parents": [GDRIVE_FOLDER_ID]}
-    service.files().create(
-        body=file_metadata,
-        media_body=media,
-        supportsAllDrives=True,
-        fields="id"
-    ).execute()
-
-
-def descargar_archivo_twilio(url):
-    response = req.get(url, auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN))
-    return response.content, response.headers.get("Content-Type", "application/octet-stream")
-
-
-def get_extension(media_type):
-    if "pdf" in media_type:
-        return "pdf"
-    elif "jpeg" in media_type or "jpg" in media_type:
-        return "jpg"
-    elif "png" in media_type:
-        return "png"
-    elif "zip" in media_type or "x-zip" in media_type:
-        return "zip"
-    elif "rar" in media_type:
-        return "rar"
-    elif "mp4" in media_type:
-        return "mp4"
-    elif "quicktime" in media_type:
-        return "mov"
-    elif "text" in media_type:
-        return "txt"
-    else:
-        return "bin"
-
-
-def interpretar_mensaje(mensaje, remitente):
-    headers = {
-        "x-api-key": ANTHROPIC_API_KEY,
-        "anthropic-version": "2023-06-01",
-        "content-type": "application/json"
-    }
-    prompt = (
-        "Sos un asistente financiero para un negocio gastronomico en Argentina "
-        "(bar, fabrica de cerveza artesanal, beer truck para eventos).\n\n"
-        "REGLAS IMPORTANTES:\n"
-        "- Una transferencia interna es cuando el dinero se mueve entre cuentas PROPIAS del negocio (ej: de Galicia a MercadoPago)\n"
-        "- Si el mensaje menciona un proveedor con un monto y medio de pago, SIEMPRE es un EGRESO, nunca interno\n"
-        "- Si no hay medio de pago mencionado, asumir Efectivo por defecto\n"
-        "- Comandos validos: /saldo, /reporte, /pendientes, /ayuda\n\n"
-        "Interpreta el mensaje y devuelve SOLO JSON con esta estructura:\n"
+    return (
+        "Sos un parser de movimientos financieros para un ERP.\n\n"
+        "Catálogo disponible para esta organización:\n"
+        f"- businessUnits: {json.dumps(catalog.get('businessUnits', []), ensure_ascii=False)}\n"
+        f"- classifications: {json.dumps(catalog.get('classifications', []), ensure_ascii=False)}\n"
+        f"- concepts: {json.dumps(catalog.get('concepts', []), ensure_ascii=False)}\n"
+        f"- movementTypes: {json.dumps(catalog.get('movementTypes', []), ensure_ascii=False)}\n"
+        f"- paymentMethods: {json.dumps(catalog.get('paymentMethods', []), ensure_ascii=False)}\n"
+        f"- counterparties: {json.dumps(catalog.get('counterparties', []), ensure_ascii=False)}\n"
+        f"- receiptTypes: {json.dumps(catalog.get('receiptTypes', []), ensure_ascii=False)}\n"
+        f"{adjunto_block}\n"
+        f"Fecha de hoy: {today}\n"
+        f'Mensaje del usuario: "{body}"\n\n'
+        "Devolvé JSON exacto con estos campos:\n"
         "{\n"
-        '  "tipo": "egreso" o "ingreso" o "comando" o "error",\n'
-        '  "comando": "/saldo" o "/reporte" o "/pendientes" o "/ayuda" o null,\n'
-        '  "proveedor": "nombre" o null,\n'
-        '  "concepto": "descripcion" o null,\n'
-        '  "monto": numero o null,\n'
-        '  "medio_pago": "Efectivo" o "Transferencia" o "MercadoPago" o "Echeq" o null,\n'
-        '  "fecha": "dd-mm-yyyy" o null,\n'
-        '  "es_interno": true o false,\n'
-        '  "error": "descripcion" o null,\n'
-        '  "confirmacion": "texto confirmacion"\n'
+        '  "kind": "egreso" | "ingreso",\n'
+        '  "classificationId": "<uuid del catálogo>",\n'
+        '  "conceptId": "<uuid del catálogo>",\n'
+        '  "movementTypeId": "<uuid>",\n'
+        '  "paymentMethodId": "<uuid>",\n'
+        '  "counterpartyId": "<uuid o null>",\n'
+        '  "counterpartyName": "<string si la contraparte no está en el catálogo, null si ya viene counterpartyId>",\n'
+        '  "businessUnitId": "<uuid>",\n'
+        '  "amount": <number>,\n'
+        '  "movementDate": "YYYY-MM-DD (hoy si no se menciona ni en texto ni en el adjunto)",\n'
+        '  "status": "pendiente" | "pagado",\n'
+        '  "receiptTypeId": "<uuid o null>",\n'
+        '  "receiptNumber": "<string o null>",\n'
+        '  "notes": "<string o null — incluí CUIT acá si lo viste>"\n'
         "}\n\n"
-        f"Fecha de hoy: {datetime.now().strftime('%d-%m-%Y')}\n"
-        f"Mensaje: {mensaje}\n"
-        f"Remitente: {remitente}"
+        "Reglas generales:\n"
+        '- Si el mensaje menciona "pagado", "cobrado", "ya pagué", "pagué" → status = "pagado".\n'
+        '- Si menciona "pendiente", "por pagar", "a pagar", o no especifica → status = "pendiente".\n'
+        "- Si la contraparte no existe en counterparties, devolvé counterpartyId: null y counterpartyName con el texto.\n"
+        '- Si no se menciona método de pago, usá "Efectivo".\n'
+        "- NUNCA inventes UUIDs que no estén en el catálogo.\n"
+        '- Si algún campo obligatorio no puede inferirse, respondé con un objeto {"error": "motivo"} en lugar del JSON de movimiento.\n\n'
+        "Reglas de resolución texto vs adjunto (cuando hay adjunto):\n"
+        "- Monto (amount): gana el adjunto salvo que el texto diga explícitamente otro número.\n"
+        "- Fecha: gana el adjunto salvo que el texto especifique otra.\n"
+        "- Contraparte / razón social: gana el adjunto.\n"
+        "- Método de pago y status: gana el texto del usuario.\n"
+        "- Número de comprobante: del adjunto.\n"
+        "- Si el adjunto es ilegible o no parece un comprobante, ignoralo y parseá solo el texto.\n\n"
+        "Respondé SOLO el JSON, sin markdown ni explicación."
     )
-    body = {
-        "model": "claude-sonnet-4-20250514",
-        "max_tokens": 500,
-        "messages": [{"role": "user", "content": prompt}]
-    }
-    response = req.post(
-        "https://api.anthropic.com/v1/messages",
-        headers=headers,
-        json=body
+
+
+def claude_parse(body: str, catalog: dict, media_bytes: bytes | None, media_mime: str | None) -> dict:
+    content_blocks: list = []
+
+    if media_bytes and media_mime:
+        b64 = base64.b64encode(media_bytes).decode()
+        if media_mime in PDF_MIMES:
+            content_blocks.append({
+                "type": "document",
+                "source": {
+                    "type": "base64",
+                    "media_type": "application/pdf",
+                    "data": b64,
+                },
+            })
+        elif media_mime in IMAGE_MIMES:
+            content_blocks.append({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": media_mime,
+                    "data": b64,
+                },
+            })
+
+    has_attachment = bool(content_blocks)
+    content_blocks.append({
+        "type": "text",
+        "text": build_prompt_text(catalog, body, has_attachment=has_attachment),
+    })
+
+    resp = claude.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=1500,
+        messages=[{"role": "user", "content": content_blocks}],
     )
-    response_json = response.json()
-    if "content" not in response_json:
-        raise Exception(f"API error: {response_json}")
-    texto = response_json["content"][0]["text"]
-    texto = re.sub(r'```json|```', '', texto).strip()
-    return json.loads(texto)
+
+    text = resp.content[0].text
+    text = re.sub(r"```json|```", "", text).strip()
+    return json.loads(text)
 
 
-def generar_archivo_registro(datos, remitente):
-    fecha = datos.get("fecha") or datetime.now().strftime("%d-%m-%Y")
-    ahora = datetime.now().strftime("%d-%m-%Y %H:%M")
-    if datos["tipo"] == "egreso":
-        contenido = (
-            "TIPO: EGRESO\n"
-            f"FECHA: {fecha}\n"
-            f"PROVEEDOR: {datos.get('proveedor', 'Sin especificar')}\n"
-            f"CONCEPTO: {datos.get('concepto', 'Sin especificar')}\n"
-            f"MONTO: ${datos.get('monto', 0):,.2f}\n"
-            f"MEDIO DE PAGO: {datos.get('medio_pago', 'Sin especificar')}\n"
-            f"REGISTRADO POR: {remitente}\n"
-            f"REGISTRADO EL: {ahora}\n"
-            "FUENTE: WhatsApp Bot\n"
-        )
-        nombre = f"EGRESO_{datos.get('proveedor','sin_proveedor').replace(' ','_')}_{fecha.replace('-','')}.txt"
-    elif datos["tipo"] == "ingreso":
-        contenido = (
-            "TIPO: INGRESO\n"
-            f"FECHA: {fecha}\n"
-            f"CONCEPTO: {datos.get('concepto', 'Sin especificar')}\n"
-            f"MONTO: ${datos.get('monto', 0):,.2f}\n"
-            f"MEDIO DE COBRO: {datos.get('medio_pago', 'Sin especificar')}\n"
-            f"REGISTRADO POR: {remitente}\n"
-            f"REGISTRADO EL: {ahora}\n"
-            "FUENTE: WhatsApp Bot\n"
-        )
-        nombre = f"INGRESO_{datos.get('concepto','sin_concepto').replace(' ','_')}_{fecha.replace('-','')}.txt"
-    else:
-        contenido = f"MENSAJE NO CLASIFICADO: {datos}\nREGISTRADO EL: {ahora}\n"
-        nombre = f"PENDIENTE_{fecha.replace('-','')}.txt"
-    return nombre, contenido
+COMMAND_RESPONSES = {
+    "/ayuda": (
+        "Comandos disponibles:\n"
+        "- /saldo: Saldo actual de cajas\n"
+        "- /reporte: Resumen del mes\n"
+        "- /pendientes: Cheques y facturas por vencer\n\n"
+        "Para registrar un movimiento mandá texto libre, opcionalmente con foto/PDF del comprobante."
+    ),
+    "/saldo": "Saldo: próximamente (migración a ERP en curso).",
+    "/reporte": "Reporte: próximamente (migración a ERP en curso).",
+    "/pendientes": "Pendientes: próximamente (migración a ERP en curso).",
+}
 
 
-def respuesta_comando(comando):
-    respuestas = {
-        "/ayuda": (
-            "Comandos disponibles:\n"
-            "- /saldo: Saldo actual de cajas\n"
-            "- /reporte: Resumen del mes\n"
-            "- /pendientes: Cheques y facturas por vencer\n\n"
-            "Para registrar un egreso:\n"
-            "MGB 5000 efectivo\n"
-            "o: egreso - MGB - 5000 - transferencia\n\n"
-            "Para registrar un ingreso:\n"
-            "ingreso - servicio del dia - 50000 - nave\n\n"
-            "Para enviar archivos:\n"
-            "Manda la foto, PDF o ZIP directamente"
-        ),
-        "/saldo": "Para consultar el saldo, Claude lo procesara en el proximo ciclo de Cowork.",
-        "/reporte": "Para generar el reporte, Claude lo procesara en el proximo ciclo de Cowork.",
-        "/pendientes": "Para ver los pendientes, Claude los revisara en el proximo ciclo de Cowork."
-    }
-    return respuestas.get(comando, "Comando no reconocido. Escribi /ayuda.")
+def is_command(text: str) -> str | None:
+    t = text.strip().lower()
+    if t in COMMAND_RESPONSES:
+        return t
+    return None
+
+
+def twilio_reply(text: str) -> str:
+    resp = MessagingResponse()
+    resp.message(text)
+    return str(resp)
 
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    incoming_msg = request.values.get("Body", "").strip()
-    remitente = request.values.get("From", "").replace("whatsapp:", "")
-    num_media = int(request.values.get("NumMedia", 0))
-
-    resp = MessagingResponse()
-    msg = resp.message()
-
-    if NUMEROS_AUTORIZADOS and remitente not in NUMEROS_AUTORIZADOS:
-        msg.body("No estas autorizado para usar este bot.")
-        return str(resp)
+    phone = request.values.get("From", "").replace("whatsapp:", "")
+    body = (request.values.get("Body") or "").strip()
+    sid = request.values.get("MessageSid", "")
+    num_media = int(request.values.get("NumMedia", 0) or 0)
+    media_url = request.values.get("MediaUrl0") if num_media > 0 else None
+    media_mime = request.values.get("MediaContentType0") if num_media > 0 else None
 
     try:
-        # CASO 1: Archivos adjuntos via MediaUrl
-        if num_media > 0:
-            archivos_guardados = []
-            ahora = datetime.now().strftime("%d%m%Y_%H%M%S")
-            for i in range(num_media):
-                media_url = request.values.get(f"MediaUrl{i}")
-                media_type = request.values.get(f"MediaContentType{i}", "")
-                ext = get_extension(media_type)
-                if incoming_msg and len(incoming_msg) < 50 and not es_nombre_archivo(incoming_msg):
-                    texto_limpio = incoming_msg[:30].replace(" ", "_").replace("/", "-")
-                    nombre_archivo = f"ARCHIVO_{texto_limpio}_{ahora}_{i+1}.{ext}"
-                else:
-                    nombre_archivo = f"ARCHIVO_{ahora}_{i+1}.{ext}"
-                contenido_bytes, mimetype = descargar_archivo_twilio(media_url)
-                subir_binario_a_drive(nombre_archivo, contenido_bytes, mimetype)
-                archivos_guardados.append(nombre_archivo)
-            msg.body(f"📁 {len(archivos_guardados)} archivo(s) guardado(s) en carpeta Para Claude:\n" + "\n".join(archivos_guardados))
-            return str(resp)
+        cmd = is_command(body) if body and not media_url else None
+        if cmd:
+            return twilio_reply(COMMAND_RESPONSES[cmd])
 
-        # CASO 2: El Body parece un nombre de archivo (ZIP, PDF, etc sin MediaUrl)
-        if incoming_msg and es_nombre_archivo(incoming_msg):
-            ahora = datetime.now().strftime("%d%m%Y_%H%M%S")
-            nombre_archivo = f"ARCHIVO_{ahora}.txt"
-            contenido = f"ARCHIVO RECIBIDO: {incoming_msg}\nFECHA: {datetime.now().strftime('%d-%m-%Y %H:%M')}\nNOTA: El archivo no pudo descargarse automaticamente. Revisarlo manualmente.\n"
-            subir_texto_a_drive(nombre_archivo, contenido)
-            msg.body(f"📁 Archivo registrado: {incoming_msg}\n\nNota: el sandbox de Twilio tiene limitaciones con algunos tipos de archivo. Para enviarlo correctamente usa el numero de produccion de Twilio.")
-            return str(resp)
+        if not body and not media_url:
+            return twilio_reply("Mensaje vacío. Escribí /ayuda.")
 
-        # CASO 3: Solo texto
-        if not incoming_msg:
-            msg.body("Mensaje vacio. Escribi /ayuda.")
-            return str(resp)
+        media_bytes = None
+        if media_url:
+            r = httpx.get(media_url, auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN), timeout=30)
+            r.raise_for_status()
+            media_bytes = r.content
 
-        datos = interpretar_mensaje(incoming_msg, remitente)
+        catalog = fetch_catalog(phone)
+        parsed = claude_parse(body, catalog, media_bytes, media_mime)
 
-        if datos["tipo"] == "comando":
-            msg.body(respuesta_comando(datos.get("comando", "/ayuda")))
-            return str(resp)
+        if "error" in parsed:
+            return twilio_reply(f"No pude interpretar: {parsed['error']}")
 
-        if datos.get("es_interno"):
-            msg.body("Transferencia interna - no se registra.")
-            return str(resp)
+        attachment_path = None
+        if media_bytes:
+            attachment_path = upload_attachment(phone, sid, media_mime, media_bytes)
 
-        if datos["tipo"] == "error":
-            msg.body(f"No pude interpretar: {datos.get('error', 'dato faltante')}. Escribi /ayuda.")
-            return str(resp)
+        result = ingest({
+            "phone": phone,
+            "originRef": sid,
+            "attachmentPath": attachment_path,
+            **parsed,
+        })
 
-        nombre_archivo, contenido = generar_archivo_registro(datos, remitente)
-        subir_texto_a_drive(nombre_archivo, contenido)
-        emoji = "💸" if datos["tipo"] == "egreso" else "💰"
-        confirmacion = datos.get("confirmacion") or "Registrado correctamente."
-        msg.body(f"{emoji} {confirmacion}\n\nGuardado en carpeta Para Claude.")
+        if result.get("duplicated"):
+            return twilio_reply("Movimiento ya registrado previamente.")
 
+        amount = result.get("amount", parsed.get("amount", 0))
+        status = result.get("status", parsed.get("status", ""))
+        emoji = "💸" if parsed.get("kind") == "egreso" else "💰"
+        return twilio_reply(f"{emoji} {parsed['kind']} ${float(amount):,.0f} ({status})")
+
+    except httpx.HTTPStatusError as e:
+        code = e.response.status_code
+        if code == 403:
+            return twilio_reply("Número no autorizado.")
+        return twilio_reply(f"Error ingest ({code}).")
     except json.JSONDecodeError:
-        msg.body("Error interpretando el mensaje. Intenta de nuevo o escribi /ayuda.")
+        return twilio_reply("Error interpretando el mensaje. Intentá de nuevo.")
     except Exception as e:
-        msg.body(f"Error: {str(e)[:500]}")
-
-    return str(resp)
+        return twilio_reply(f"Error: {str(e)[:400]}")
 
 
 @app.route("/", methods=["GET"])
