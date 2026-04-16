@@ -17,6 +17,7 @@ from twilio.twiml.messaging_response import MessagingResponse
 from bialystok_client import (
     confirm_pending,
     fetch_catalog,
+    fetch_summary,
     ingest,
     list_pending,
     upload_attachment,
@@ -204,20 +205,46 @@ def claude_parse(body: str, catalog: dict, media_bytes: bytes | None, media_mime
 COMMAND_RESPONSES = {
     "/ayuda": (
         "Comandos:\n"
-        "- /saldo, /reporte, /pendientes: próximamente\n"
+        "- /resumen: pagos pendientes próximos 7 y 30 días\n"
         "- /cancelar: cancela selección pendiente\n\n"
-        "Mandá texto libre con foto/PDF para registrar movimiento. "
+        "Mandá texto libre con foto/PDF/audio para registrar movimiento. "
         "Si aparecen opciones de proveedor, respondé con el número."
     ),
-    "/saldo": "Saldo: próximamente.",
-    "/reporte": "Reporte: próximamente.",
-    "/pendientes": "Pendientes: próximamente.",
 }
+
+# Commands that need dynamic handling (not static responses)
+DYNAMIC_COMMANDS = {"/resumen"}
+
+
+def format_summary_section(title: str, items: list, total: float) -> str:
+    if not items:
+        return f"{title}: sin pendientes"
+    lines = [f"{title} ({len(items)} pagos, {format_amount(total)}):"]
+    for m in items[:10]:
+        cp = m.get("counterparty_name") or "Sin proveedor"
+        lines.append(f"  • {format_amount(m.get('amount', 0))} → {cp} ({m.get('movement_date', '')})")
+    if len(items) > 10:
+        lines.append(f"  ... y {len(items) - 10} más")
+    return "\n".join(lines)
+
+
+def handle_summary(phone: str) -> str:
+    data = fetch_summary(phone)
+    sections = []
+    overdue = data.get("overdue", {})
+    if overdue.get("count", 0) > 0:
+        sections.append(format_summary_section(
+            "⚠️ *VENCIDOS*", overdue.get("items", []), overdue.get("total", 0)))
+    sections.append(format_summary_section(
+        "📅 *Próximos 7 días*", data.get("next7", {}).get("items", []), data.get("next7", {}).get("total", 0)))
+    sections.append(format_summary_section(
+        "📅 *Próximos 30 días*", data.get("next30", {}).get("items", []), data.get("next30", {}).get("total", 0)))
+    return "\n\n".join(sections)
 
 
 def is_command(text: str) -> str | None:
     t = text.strip().lower()
-    if t in COMMAND_RESPONSES:
+    if t in COMMAND_RESPONSES or t in DYNAMIC_COMMANDS:
         return t
     return None
 
@@ -511,7 +538,10 @@ def webhook():
 
             cmd = is_command(body)
             if cmd:
-                return twilio_reply(COMMAND_RESPONSES[cmd])
+                if cmd in COMMAND_RESPONSES:
+                    return twilio_reply(COMMAND_RESPONSES[cmd])
+                if cmd == "/resumen":
+                    return twilio_reply(handle_summary(phone))
 
         if not body and not media_url:
             return twilio_reply("Mensaje vacío. Escribí /ayuda.")

@@ -55,3 +55,7 @@ def confirm_pending(phone: str, choice: dict, pending_id: str | None = None) -> 
     if pending_id:
         payload["pendingId"] = pending_id
     return _post(payload)
+
+
+def fetch_summary(phone: str) -> dict:
+    return _post({"action": "summary", "phone": phone})
