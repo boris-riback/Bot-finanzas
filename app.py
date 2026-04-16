@@ -139,19 +139,24 @@ def build_prompt_text(catalog: dict, body: str, has_attachment: bool) -> str:
         '- Si el mensaje menciona "pagado", "cobrado", "ya pagué", "pagué" → status = "pagado".\n'
         '- Si menciona "pendiente", "por pagar", "a pagar", o no especifica → status = "pendiente".\n'
         "- counterpartyId: devolvé null salvo que el nombre coincida EXACTAMENTE con uno del catálogo. Si hay duda, null y poné el nombre crudo en counterpartyName.\n"
-        '- Si el usuario dice "varios" o "proveedor varios", poné counterpartyName: "varios".\n'
+        '- Si el usuario dice "varios" o "proveedor varios" en el TEXTO, poné counterpartyName: "varios". Pero si "VARIOS" aparece solo en el comprobante como referencia/leyenda bancaria, NO es el proveedor — dejá counterpartyName en null.\n'
         '- Si no se menciona método de pago, usá "Efectivo".\n'
         "- NUNCA inventes UUIDs que no estén en el catálogo.\n"
+        "- NUNCA inventes o adivines clasificación, concepto, o tipo de movimiento. Si el usuario o el comprobante no dicen explícitamente de qué rubro/categoría se trata, usá los valores más genéricos del catálogo (ej: la primera clasificación y concepto disponibles). NO intentes deducir el rubro a partir del tipo de comprobante.\n"
         "- notes: capturá toda observación libre del usuario que no sea un campo del catálogo. Ejemplos de disparadores: \"nota:\", \"obs:\", \"observación:\", \"aclaración:\", \"porque\", \"para\", \"es por\", \"corresponde a\", frases entre paréntesis o después de un guión. También sumá el CUIT si aparece.\n"
         "- Si el usuario dice p.ej. \"egreso 5000 a test por el evento de junio\", notes debe ser \"por el evento de junio\" (NO inventes, solo copiá literal lo relevante).\n"
         "- Combinalos con \"; \" si hay varios datos (ej: \"CUIT 20-12345678-9; por el evento de junio\").\n"
         '- Si algún campo obligatorio no puede inferirse, respondé con un objeto {"error": "motivo"} en lugar del JSON de movimiento.\n\n'
+        "Reglas de lectura de comprobantes bancarios:\n"
+        "- En transferencias bancarias, las 'Leyendas adicionales' suelen ser: nombre del titular, CUIT, referencia/concepto libre, y banco. NO confundir la referencia (ej: 'VARIOS') con el nombre del proveedor/destinatario.\n"
+        "- El destinatario de una transferencia generalmente NO aparece en el comprobante del emisor. Si no hay dato claro del destinatario, counterpartyName = null.\n"
+        "- 'Trf Inmed Proveed' = Transferencia Inmediata a Proveedor → kind = 'egreso', paymentMethod = 'Transferencia', status = 'pagado'.\n\n"
         "Reglas de resolución texto vs adjunto (cuando hay adjunto):\n"
         "- Monto (amount): gana el adjunto salvo que el texto diga explícitamente otro número.\n"
         "- Fecha: gana el adjunto salvo que el texto especifique otra.\n"
-        "- Contraparte (counterpartyName): si el usuario nombra un proveedor en el texto, GANA el texto. Si el usuario no lo nombra, usá la razón social del adjunto.\n"
+        "- Contraparte (counterpartyName): si el usuario nombra un proveedor en el texto, GANA el texto. Si el usuario no lo nombra, buscá razón social del DESTINATARIO en el adjunto. Si no hay destinatario claro, null.\n"
         "- counterpartyAliasHints: meté TODO nombre de razón social/titular visto en el adjunto que NO coincida con counterpartyName (para aprender alias). Si no hay diferencias, [].\n"
-        "- CBU/alias: solo del adjunto.\n"
+        "- CBU/alias: solo del adjunto, solo si corresponde al DESTINATARIO (no al emisor).\n"
         "- Método de pago y status: gana el texto del usuario.\n"
         "- Número de comprobante: del adjunto.\n"
         "- Si el adjunto es ilegible o no parece un comprobante, ignoralo y parseá solo el texto.\n\n"
