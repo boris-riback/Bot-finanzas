@@ -66,7 +66,8 @@ def build_prompt_text(catalog: dict, body: str, has_attachment: bool) -> str:
         '  "movementTypeId": "<uuid>",\n'
         '  "paymentMethodId": "<uuid>",\n'
         '  "counterpartyId": "<uuid si estás 100% seguro que matchea una counterparty del catálogo, si no null>",\n'
-        '  "counterpartyName": "<nombre tal como aparece en el texto o comprobante, null si no hay>",\n'
+        '  "counterpartyName": "<nombre del proveedor que el usuario quiere asociar, null si no hay>",\n'
+        '  "counterpartyAliasHints": ["otros nombres razón social vistos en el comprobante que no coinciden con counterpartyName"],\n'
         '  "counterpartyCbu": "<CBU o alias bancario del comprobante si aparece, null si no>",\n'
         '  "businessUnitId": "<uuid>",\n'
         '  "amount": <number>,\n'
@@ -87,7 +88,8 @@ def build_prompt_text(catalog: dict, body: str, has_attachment: bool) -> str:
         "Reglas de resolución texto vs adjunto (cuando hay adjunto):\n"
         "- Monto (amount): gana el adjunto salvo que el texto diga explícitamente otro número.\n"
         "- Fecha: gana el adjunto salvo que el texto especifique otra.\n"
-        "- Contraparte / razón social: gana el adjunto.\n"
+        "- Contraparte (counterpartyName): si el usuario nombra un proveedor en el texto, GANA el texto. Si el usuario no lo nombra, usá la razón social del adjunto.\n"
+        "- counterpartyAliasHints: meté TODO nombre de razón social/titular visto en el adjunto que NO coincida con counterpartyName (para aprender alias). Si no hay diferencias, [].\n"
         "- CBU/alias: solo del adjunto.\n"
         "- Método de pago y status: gana el texto del usuario.\n"
         "- Número de comprobante: del adjunto.\n"
