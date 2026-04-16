@@ -1,4 +1,5 @@
 import base64
+import io
 import json
 import os
 import re
@@ -7,6 +8,7 @@ from datetime import datetime
 import anthropic
 import httpx
 from flask import Flask, request
+from openai import OpenAI
 from twilio.twiml.messaging_response import MessagingResponse
 
 from bialystok_client import (
@@ -23,11 +25,45 @@ TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN")
 TWILIO_WHATSAPP_NUMBER = os.environ.get("TWILIO_WHATSAPP_NUMBER")
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 
 IMAGE_MIMES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
 PDF_MIMES = {"application/pdf"}
+AUDIO_MIME_EXT = {
+    "audio/ogg": "ogg",
+    "audio/opus": "ogg",
+    "audio/mpeg": "mp3",
+    "audio/mp3": "mp3",
+    "audio/mp4": "m4a",
+    "audio/m4a": "m4a",
+    "audio/x-m4a": "m4a",
+    "audio/wav": "wav",
+    "audio/x-wav": "wav",
+    "audio/webm": "webm",
+    "audio/amr": "amr",
+}
 
 claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+
+
+def is_audio_mime(mime: str | None) -> bool:
+    return bool(mime) and mime.split(";")[0].strip().lower() in AUDIO_MIME_EXT
+
+
+def transcribe_audio(audio_bytes: bytes, mime: str) -> str:
+    if not openai_client:
+        raise RuntimeError("OPENAI_API_KEY no configurada.")
+    normalized = mime.split(";")[0].strip().lower()
+    ext = AUDIO_MIME_EXT.get(normalized, "ogg")
+    buf = io.BytesIO(audio_bytes)
+    buf.name = f"voice.{ext}"
+    resp = openai_client.audio.transcriptions.create(
+        model="whisper-1",
+        file=buf,
+        language="es",
+    )
+    return (resp.text or "").strip()
 
 
 def build_prompt_text(catalog: dict, body: str, has_attachment: bool) -> str:
@@ -280,6 +316,17 @@ def webhook():
             r = httpx.get(media_url, auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN), timeout=30)
             r.raise_for_status()
             media_bytes = r.content
+
+        if media_bytes and is_audio_mime(media_mime):
+            transcript = transcribe_audio(media_bytes, media_mime)
+            if not transcript:
+                return twilio_reply("No pude transcribir el audio. Mandalo otra vez o escribilo.")
+            pending_reply = handle_pending_reply(phone, transcript)
+            if pending_reply is not None:
+                return pending_reply
+            body = f"{body} {transcript}".strip() if body else transcript
+            media_bytes = None
+            media_mime = None
 
         catalog = fetch_catalog(phone)
         parsed = claude_parse(body, catalog, media_bytes, media_mime)
