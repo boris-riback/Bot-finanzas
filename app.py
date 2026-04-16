@@ -262,23 +262,10 @@ def format_movement_reply(movement: dict, parsed_fallback: dict | None = None) -
     lines = [f"{emoji} *{kind.upper()}* {format_amount(amount)}"]
     if cp:
         lines.append(f"👤 {cp}")
-    details = []
-    if classification:
-        details.append(classification)
-    if concept:
-        details.append(concept)
-    if details:
-        lines.append(f"🏷️ {' → '.join(details)}")
     if payment_method:
         lines.append(f"💳 {payment_method}")
     if date:
         lines.append(f"📅 {date}")
-    if business_unit:
-        lines.append(f"🏢 {business_unit}")
-    if receipt_number:
-        lines.append(f"🧾 {receipt_number}")
-    status_emoji = "✅" if status == "pagado" else "⏳"
-    lines.append(f"{status_emoji} {status}")
     if notes:
         lines.append(f"📝 {notes}")
     return "\n".join(lines)
