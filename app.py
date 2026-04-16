@@ -318,7 +318,7 @@ def webhook():
 
         media_bytes = None
         if media_url:
-            r = httpx.get(media_url, auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN), timeout=30)
+            r = httpx.get(media_url, auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN), timeout=30, follow_redirects=True)
             r.raise_for_status()
             media_bytes = r.content
 
