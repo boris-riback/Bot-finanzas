@@ -314,7 +314,11 @@ def webhook():
         code = e.response.status_code
         if code == 403:
             return twilio_reply("Número no autorizado.")
-        return twilio_reply(f"Error ingest ({code}).")
+        try:
+            detail = e.response.json().get("error") or e.response.text
+        except Exception:
+            detail = e.response.text
+        return twilio_reply(f"Error ingest ({code}): {str(detail)[:300]}")
     except json.JSONDecodeError:
         return twilio_reply("Error interpretando el mensaje. Intentá de nuevo.")
     except Exception as e:
