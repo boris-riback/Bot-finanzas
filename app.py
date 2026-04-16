@@ -9,7 +9,13 @@ import httpx
 from flask import Flask, request
 from twilio.twiml.messaging_response import MessagingResponse
 
-from bialystok_client import fetch_catalog, ingest, upload_attachment
+from bialystok_client import (
+    confirm_pending,
+    fetch_catalog,
+    ingest,
+    list_pending,
+    upload_attachment,
+)
 
 app = Flask(__name__)
 
@@ -29,11 +35,12 @@ def build_prompt_text(catalog: dict, body: str, has_attachment: bool) -> str:
     adjunto_block = ""
     if has_attachment:
         adjunto_block = (
-            "\nSe adjunta un comprobante (PDF o imagen). Mirá el documento y extraé:\n"
+            "\nSe adjunta un comprobante (PDF o imagen). Miralo y extraé:\n"
             "- monto total (amount)\n"
             "- fecha del comprobante (movementDate)\n"
             "- razón social / proveedor / contraparte\n"
             "- CUIT si está visible\n"
+            "- CBU o alias bancario destino si aparece (counterpartyCbu)\n"
             "- tipo y número de comprobante (Factura A/B/C, Recibo, Ticket, Transferencia, etc.)\n"
             "- método de pago si está indicado\n"
         )
@@ -58,8 +65,9 @@ def build_prompt_text(catalog: dict, body: str, has_attachment: bool) -> str:
         '  "conceptId": "<uuid del catálogo>",\n'
         '  "movementTypeId": "<uuid>",\n'
         '  "paymentMethodId": "<uuid>",\n'
-        '  "counterpartyId": "<uuid o null>",\n'
-        '  "counterpartyName": "<string si la contraparte no está en el catálogo, null si ya viene counterpartyId>",\n'
+        '  "counterpartyId": "<uuid si estás 100% seguro que matchea una counterparty del catálogo, si no null>",\n'
+        '  "counterpartyName": "<nombre tal como aparece en el texto o comprobante, null si no hay>",\n'
+        '  "counterpartyCbu": "<CBU o alias bancario del comprobante si aparece, null si no>",\n'
         '  "businessUnitId": "<uuid>",\n'
         '  "amount": <number>,\n'
         '  "movementDate": "YYYY-MM-DD (hoy si no se menciona ni en texto ni en el adjunto)",\n'
@@ -71,7 +79,8 @@ def build_prompt_text(catalog: dict, body: str, has_attachment: bool) -> str:
         "Reglas generales:\n"
         '- Si el mensaje menciona "pagado", "cobrado", "ya pagué", "pagué" → status = "pagado".\n'
         '- Si menciona "pendiente", "por pagar", "a pagar", o no especifica → status = "pendiente".\n'
-        "- Si la contraparte no existe en counterparties, devolvé counterpartyId: null y counterpartyName con el texto.\n"
+        "- counterpartyId: devolvé null salvo que el nombre coincida EXACTAMENTE con uno del catálogo. Si hay duda, null y poné el nombre crudo en counterpartyName.\n"
+        '- Si el usuario dice "varios" o "proveedor varios", poné counterpartyName: "varios".\n'
         '- Si no se menciona método de pago, usá "Efectivo".\n'
         "- NUNCA inventes UUIDs que no estén en el catálogo.\n"
         '- Si algún campo obligatorio no puede inferirse, respondé con un objeto {"error": "motivo"} en lugar del JSON de movimiento.\n\n'
@@ -79,6 +88,7 @@ def build_prompt_text(catalog: dict, body: str, has_attachment: bool) -> str:
         "- Monto (amount): gana el adjunto salvo que el texto diga explícitamente otro número.\n"
         "- Fecha: gana el adjunto salvo que el texto especifique otra.\n"
         "- Contraparte / razón social: gana el adjunto.\n"
+        "- CBU/alias: solo del adjunto.\n"
         "- Método de pago y status: gana el texto del usuario.\n"
         "- Número de comprobante: del adjunto.\n"
         "- Si el adjunto es ilegible o no parece un comprobante, ignoralo y parseá solo el texto.\n\n"
@@ -94,20 +104,12 @@ def claude_parse(body: str, catalog: dict, media_bytes: bytes | None, media_mime
         if media_mime in PDF_MIMES:
             content_blocks.append({
                 "type": "document",
-                "source": {
-                    "type": "base64",
-                    "media_type": "application/pdf",
-                    "data": b64,
-                },
+                "source": {"type": "base64", "media_type": "application/pdf", "data": b64},
             })
         elif media_mime in IMAGE_MIMES:
             content_blocks.append({
                 "type": "image",
-                "source": {
-                    "type": "base64",
-                    "media_type": media_mime,
-                    "data": b64,
-                },
+                "source": {"type": "base64", "media_type": media_mime, "data": b64},
             })
 
     has_attachment = bool(content_blocks)
@@ -129,15 +131,15 @@ def claude_parse(body: str, catalog: dict, media_bytes: bytes | None, media_mime
 
 COMMAND_RESPONSES = {
     "/ayuda": (
-        "Comandos disponibles:\n"
-        "- /saldo: Saldo actual de cajas\n"
-        "- /reporte: Resumen del mes\n"
-        "- /pendientes: Cheques y facturas por vencer\n\n"
-        "Para registrar un movimiento mandá texto libre, opcionalmente con foto/PDF del comprobante."
+        "Comandos:\n"
+        "- /saldo, /reporte, /pendientes: próximamente\n"
+        "- /cancelar: cancela selección pendiente\n\n"
+        "Mandá texto libre con foto/PDF para registrar movimiento. "
+        "Si aparecen opciones de proveedor, respondé con el número."
     ),
-    "/saldo": "Saldo: próximamente (migración a ERP en curso).",
-    "/reporte": "Reporte: próximamente (migración a ERP en curso).",
-    "/pendientes": "Pendientes: próximamente (migración a ERP en curso).",
+    "/saldo": "Saldo: próximamente.",
+    "/reporte": "Reporte: próximamente.",
+    "/pendientes": "Pendientes: próximamente.",
 }
 
 
@@ -154,6 +156,101 @@ def twilio_reply(text: str) -> str:
     return str(resp)
 
 
+def format_amount(value) -> str:
+    try:
+        return f"${float(value):,.0f}"
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def format_movement_reply(movement: dict, parsed_fallback: dict | None = None) -> str:
+    fb = parsed_fallback or {}
+    kind = movement.get("kind") or fb.get("kind") or ""
+    amount = movement.get("amount", fb.get("amount", 0))
+    status = movement.get("status") or fb.get("status") or ""
+    cp = movement.get("counterparty_name") or fb.get("counterpartyName") or ""
+    emoji = "💸" if kind == "egreso" else "💰"
+    suffix = f" a {cp}" if cp else ""
+    return f"{emoji} {kind} {format_amount(amount)}{suffix} ({status})"
+
+
+def format_candidate_menu(candidates: list, suggested_name: str, suggested_cbu: str) -> str:
+    lines = []
+    if suggested_cbu:
+        lines.append(f'No reconocí el proveedor de "{suggested_name or suggested_cbu}".')
+    elif suggested_name:
+        lines.append(f'No reconocí al proveedor "{suggested_name}".')
+    else:
+        lines.append("No encontré proveedor.")
+    lines.append("")
+    lines.append("¿Cuál es? Respondé con el número:")
+    for i, c in enumerate(candidates[:5], start=1):
+        lines.append(f"{i}. {c.get('name')}")
+    next_idx = min(len(candidates), 5) + 1
+    if suggested_name:
+        lines.append(f"{next_idx}. Crear nuevo: {suggested_name}")
+    lines.append(f"{next_idx + 1}. Cancelar")
+    return "\n".join(lines)
+
+
+NUMERIC_REPLY = re.compile(r"^\s*(\d+)\s*$")
+
+
+def try_parse_numeric(body: str) -> int | None:
+    m = NUMERIC_REPLY.match(body or "")
+    return int(m.group(1)) if m else None
+
+
+def handle_pending_reply(phone: str, body: str) -> str | None:
+    """Return twilio reply string if this message resolves a pending selection; else None."""
+    lower = (body or "").strip().lower()
+    if lower == "/cancelar":
+        resp = confirm_pending(phone, {"kind": "cancel"})
+        if resp.get("cancelled"):
+            return twilio_reply("Selección cancelada.")
+        return None
+
+    choice_num = try_parse_numeric(body)
+    if choice_num is None:
+        return None
+
+    pending_resp = list_pending(phone)
+    pending = pending_resp.get("pending")
+    if not pending:
+        return None
+
+    candidates = pending.get("candidates") or []
+    raw_name = pending.get("raw_counterparty_name") or ""
+    visible = candidates[:5]
+    create_idx = len(visible) + 1
+    cancel_idx = create_idx + 1
+
+    if 1 <= choice_num <= len(visible):
+        cp = visible[choice_num - 1]
+        result = confirm_pending(
+            phone,
+            {"kind": "existing", "counterpartyId": cp["id"]},
+            pending_id=pending["id"],
+        )
+    elif choice_num == create_idx and raw_name:
+        result = confirm_pending(
+            phone,
+            {"kind": "new", "name": raw_name},
+            pending_id=pending["id"],
+        )
+    elif choice_num == cancel_idx or (choice_num == create_idx and not raw_name):
+        result = confirm_pending(phone, {"kind": "cancel"}, pending_id=pending["id"])
+        if result.get("cancelled"):
+            return twilio_reply("Selección cancelada.")
+        return twilio_reply("No pude cancelar.")
+    else:
+        return twilio_reply("Opción inválida. Respondé con un número del menú o /cancelar.")
+
+    if result.get("duplicated"):
+        return twilio_reply("Movimiento ya registrado previamente.")
+    return twilio_reply(format_movement_reply(result))
+
+
 @app.route("/webhook", methods=["POST"])
 def webhook():
     phone = request.values.get("From", "").replace("whatsapp:", "")
@@ -164,9 +261,14 @@ def webhook():
     media_mime = request.values.get("MediaContentType0") if num_media > 0 else None
 
     try:
-        cmd = is_command(body) if body and not media_url else None
-        if cmd:
-            return twilio_reply(COMMAND_RESPONSES[cmd])
+        if not media_url and body:
+            pending_reply = handle_pending_reply(phone, body)
+            if pending_reply is not None:
+                return pending_reply
+
+            cmd = is_command(body)
+            if cmd:
+                return twilio_reply(COMMAND_RESPONSES[cmd])
 
         if not body and not media_url:
             return twilio_reply("Mensaje vacío. Escribí /ayuda.")
@@ -194,13 +296,17 @@ def webhook():
             **parsed,
         })
 
+        if result.get("status") == "needs_selection":
+            return twilio_reply(format_candidate_menu(
+                result.get("candidates") or [],
+                result.get("suggestedName") or "",
+                result.get("suggestedCbu") or "",
+            ))
+
         if result.get("duplicated"):
             return twilio_reply("Movimiento ya registrado previamente.")
 
-        amount = result.get("amount", parsed.get("amount", 0))
-        status = result.get("status", parsed.get("status", ""))
-        emoji = "💸" if parsed.get("kind") == "egreso" else "💰"
-        return twilio_reply(f"{emoji} {parsed['kind']} ${float(amount):,.0f} ({status})")
+        return twilio_reply(format_movement_reply(result, parsed))
 
     except httpx.HTTPStatusError as e:
         code = e.response.status_code

@@ -44,3 +44,14 @@ def upload_attachment(phone: str, origin_ref: str, mime: str, content: bytes) ->
 
 def ingest(payload: dict) -> dict:
     return _post({"action": "ingest", **payload})
+
+
+def list_pending(phone: str) -> dict:
+    return _post({"action": "list_pending", "phone": phone})
+
+
+def confirm_pending(phone: str, choice: dict, pending_id: str | None = None) -> dict:
+    payload = {"action": "confirm_pending", "phone": phone, "choice": choice}
+    if pending_id:
+        payload["pendingId"] = pending_id
+    return _post(payload)
