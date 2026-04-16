@@ -143,9 +143,9 @@ def build_prompt_text(catalog: dict, body: str, has_attachment: bool) -> str:
         '- Si no se menciona método de pago, usá "Efectivo".\n'
         "- NUNCA inventes UUIDs que no estén en el catálogo.\n"
         "- NUNCA inventes o adivines clasificación, concepto, o tipo de movimiento. Si el usuario o el comprobante no dicen explícitamente de qué rubro/categoría se trata, usá los valores más genéricos del catálogo (ej: la primera clasificación y concepto disponibles). NO intentes deducir el rubro a partir del tipo de comprobante.\n"
-        "- notes: capturá toda observación libre del usuario que no sea un campo del catálogo. Ejemplos de disparadores: \"nota:\", \"obs:\", \"observación:\", \"aclaración:\", \"porque\", \"para\", \"es por\", \"corresponde a\", frases entre paréntesis o después de un guión. También sumá el CUIT si aparece.\n"
+        "- notes: capturá SOLO observaciones libres del usuario que no sean un campo del catálogo. Ejemplos de disparadores: \"nota:\", \"obs:\", \"observación:\", \"aclaración:\", \"porque\", \"para\", \"es por\", \"corresponde a\", frases entre paréntesis o después de un guión.\n"
+        "- NO pongas CUIT, razón social, datos bancarios ni datos del comprobante en notes. Notes es solo para comentarios del usuario.\n"
         "- Si el usuario dice p.ej. \"egreso 5000 a test por el evento de junio\", notes debe ser \"por el evento de junio\" (NO inventes, solo copiá literal lo relevante).\n"
-        "- Combinalos con \"; \" si hay varios datos (ej: \"CUIT 20-12345678-9; por el evento de junio\").\n"
         '- Si algún campo obligatorio no puede inferirse, respondé con un objeto {"error": "motivo"} en lugar del JSON de movimiento.\n\n'
         "Reglas de lectura de comprobantes bancarios:\n"
         "- 'Trf Inmed Proveed' (Transferencia Inmediata a Proveedor) de Banco Galicia y similares:\n"
