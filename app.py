@@ -1,14 +1,17 @@
 import base64
 import io
 import json
+import logging
 import os
 import re
+import threading
 from datetime import datetime
 
 import anthropic
 import httpx
 from flask import Flask, request
 from openai import OpenAI
+from twilio.rest import Client as TwilioClient
 from twilio.twiml.messaging_response import MessagingResponse
 
 from bialystok_client import (
@@ -20,6 +23,9 @@ from bialystok_client import (
 )
 
 app = Flask(__name__)
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger("bot")
 
 TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN")
@@ -45,6 +51,7 @@ AUDIO_MIME_EXT = {
 
 claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 
 
 def is_audio_mime(mime: str | None) -> bool:
@@ -197,6 +204,15 @@ def twilio_reply(text: str) -> str:
     return str(resp)
 
 
+def send_whatsapp(to: str, text: str):
+    """Send a WhatsApp message via Twilio REST API (for async replies)."""
+    twilio_client.messages.create(
+        from_=f"whatsapp:{TWILIO_WHATSAPP_NUMBER}",
+        to=f"whatsapp:{to}",
+        body=text,
+    )
+
+
 def format_amount(value) -> str:
     try:
         return f"${float(value):,.0f}"
@@ -294,6 +310,124 @@ def handle_pending_reply(phone: str, body: str) -> str | None:
     return twilio_reply(format_movement_reply(result))
 
 
+def process_message(phone: str, body: str, sid: str, media_bytes: bytes | None, media_mime: str | None):
+    """Core processing logic. Returns reply text string."""
+    log.info("process start | phone=%s body=%r mime=%s has_media=%s", phone, body[:80], media_mime, bool(media_bytes))
+
+    if media_bytes and is_audio_mime(media_mime):
+        log.info("transcribing audio (%d bytes, %s)", len(media_bytes), media_mime)
+        transcript = transcribe_audio(media_bytes, media_mime)
+        log.info("transcript: %r", transcript[:200] if transcript else "")
+        if not transcript:
+            return "No pude transcribir el audio. Mandalo otra vez o escribilo."
+        pending_reply_text = _check_pending(phone, transcript)
+        if pending_reply_text:
+            return pending_reply_text
+        body = f"{body} {transcript}".strip() if body else transcript
+        media_bytes = None
+        media_mime = None
+
+    log.info("fetching catalog")
+    catalog = fetch_catalog(phone)
+    log.info("calling claude_parse body=%r", body[:80])
+    parsed = claude_parse(body, catalog, media_bytes, media_mime)
+    log.info("parsed: %s", json.dumps(parsed, ensure_ascii=False)[:300])
+
+    if "error" in parsed:
+        return f"No pude interpretar: {parsed['error']}"
+
+    attachment_path = None
+    if media_bytes:
+        log.info("uploading attachment")
+        attachment_path = upload_attachment(phone, sid, media_mime, media_bytes)
+
+    log.info("calling ingest")
+    result = ingest({
+        "phone": phone,
+        "originRef": sid,
+        "attachmentPath": attachment_path,
+        **parsed,
+    })
+    log.info("ingest result: %s", json.dumps(result, ensure_ascii=False)[:300])
+
+    if result.get("status") == "needs_selection":
+        return format_candidate_menu(
+            result.get("candidates") or [],
+            result.get("suggestedName") or "",
+            result.get("suggestedCbu") or "",
+        )
+
+    if result.get("duplicated"):
+        return "Movimiento ya registrado previamente."
+
+    return format_movement_reply(result, parsed)
+
+
+def _check_pending(phone: str, text: str) -> str | None:
+    """Check if text resolves a pending selection. Returns reply text or None."""
+    lower = text.strip().lower()
+    if lower == "/cancelar":
+        resp = confirm_pending(phone, {"kind": "cancel"})
+        if resp.get("cancelled"):
+            return "Selección cancelada."
+        return None
+
+    choice_num = try_parse_numeric(text)
+    if choice_num is None:
+        return None
+
+    pending_resp = list_pending(phone)
+    pending = pending_resp.get("pending")
+    if not pending:
+        return None
+
+    candidates = pending.get("candidates") or []
+    raw_name = pending.get("raw_counterparty_name") or ""
+    visible = candidates[:5]
+    create_idx = len(visible) + 1
+    cancel_idx = create_idx + 1
+
+    if 1 <= choice_num <= len(visible):
+        cp = visible[choice_num - 1]
+        result = confirm_pending(phone, {"kind": "existing", "counterpartyId": cp["id"]}, pending_id=pending["id"])
+    elif choice_num == create_idx and raw_name:
+        result = confirm_pending(phone, {"kind": "new", "name": raw_name}, pending_id=pending["id"])
+    elif choice_num == cancel_idx or (choice_num == create_idx and not raw_name):
+        result = confirm_pending(phone, {"kind": "cancel"}, pending_id=pending["id"])
+        if result.get("cancelled"):
+            return "Selección cancelada."
+        return "No pude cancelar."
+    else:
+        return "Opción inválida. Respondé con un número del menú o /cancelar."
+
+    if result.get("duplicated"):
+        return "Movimiento ya registrado previamente."
+    return format_movement_reply(result)
+
+
+def process_async(phone, body, sid, media_bytes, media_mime):
+    """Run processing in background thread, send reply via Twilio API."""
+    try:
+        reply_text = process_message(phone, body, sid, media_bytes, media_mime)
+        send_whatsapp(phone, reply_text)
+        log.info("async reply sent to %s", phone)
+    except httpx.HTTPStatusError as e:
+        code = e.response.status_code
+        if code == 403:
+            send_whatsapp(phone, "Número no autorizado.")
+            return
+        try:
+            detail = e.response.json().get("error") or e.response.text
+        except Exception:
+            detail = e.response.text
+        send_whatsapp(phone, f"Error ingest ({code}): {str(detail)[:300]}")
+    except json.JSONDecodeError:
+        send_whatsapp(phone, "Error interpretando el mensaje. Intentá de nuevo.")
+    except Exception as e:
+        log.exception("async processing error")
+        send_whatsapp(phone, f"Error: {str(e)[:400]}")
+
+
 @app.route("/webhook", methods=["POST"])
 def webhook():
     phone = request.values.get("From", "").replace("whatsapp:", "")
@@ -303,7 +437,10 @@ def webhook():
     media_url = request.values.get("MediaUrl0") if num_media > 0 else None
     media_mime = request.values.get("MediaContentType0") if num_media > 0 else None
 
+    log.info("webhook | phone=%s body=%r num_media=%d mime=%s", phone, body[:80] if body else "", num_media, media_mime)
+
     try:
+        # Quick sync replies: pending selection or commands (no heavy processing)
         if not media_url and body:
             pending_reply = handle_pending_reply(phone, body)
             if pending_reply is not None:
@@ -316,54 +453,32 @@ def webhook():
         if not body and not media_url:
             return twilio_reply("Mensaje vacío. Escribí /ayuda.")
 
+        # Download media if present
         media_bytes = None
         if media_url:
+            log.info("downloading media from %s", media_url)
             r = httpx.get(media_url, auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN), timeout=30, follow_redirects=True)
             r.raise_for_status()
             media_bytes = r.content
+            log.info("media downloaded: %d bytes", len(media_bytes))
 
+        # Audio → always async (transcription + parse takes too long for Twilio timeout)
         if media_bytes and is_audio_mime(media_mime):
-            transcript = transcribe_audio(media_bytes, media_mime)
-            if not transcript:
-                return twilio_reply("No pude transcribir el audio. Mandalo otra vez o escribilo.")
-            pending_reply = handle_pending_reply(phone, transcript)
-            if pending_reply is not None:
-                return pending_reply
-            body = f"{body} {transcript}".strip() if body else transcript
-            media_bytes = None
-            media_mime = None
+            log.info("audio detected, processing async")
+            threading.Thread(
+                target=process_async,
+                args=(phone, body, sid, media_bytes, media_mime),
+                daemon=True,
+            ).start()
+            return "", 200  # Empty 200 — no TwiML reply, async will send via API
 
-        catalog = fetch_catalog(phone)
-        parsed = claude_parse(body, catalog, media_bytes, media_mime)
-
-        if "error" in parsed:
-            return twilio_reply(f"No pude interpretar: {parsed['error']}")
-
-        attachment_path = None
-        if media_bytes:
-            attachment_path = upload_attachment(phone, sid, media_mime, media_bytes)
-
-        result = ingest({
-            "phone": phone,
-            "originRef": sid,
-            "attachmentPath": attachment_path,
-            **parsed,
-        })
-
-        if result.get("status") == "needs_selection":
-            return twilio_reply(format_candidate_menu(
-                result.get("candidates") or [],
-                result.get("suggestedName") or "",
-                result.get("suggestedCbu") or "",
-            ))
-
-        if result.get("duplicated"):
-            return twilio_reply("Movimiento ya registrado previamente.")
-
-        return twilio_reply(format_movement_reply(result, parsed))
+        # Text and image/PDF — process synchronously (usually fast enough)
+        reply_text = process_message(phone, body, sid, media_bytes, media_mime)
+        return twilio_reply(reply_text)
 
     except httpx.HTTPStatusError as e:
         code = e.response.status_code
+        log.error("HTTP error %d: %s", code, e.response.text[:300])
         if code == 403:
             return twilio_reply("Número no autorizado.")
         try:
@@ -372,8 +487,10 @@ def webhook():
             detail = e.response.text
         return twilio_reply(f"Error ingest ({code}): {str(detail)[:300]}")
     except json.JSONDecodeError:
+        log.exception("JSON decode error")
         return twilio_reply("Error interpretando el mensaje. Intentá de nuevo.")
     except Exception as e:
+        log.exception("webhook error")
         return twilio_reply(f"Error: {str(e)[:400]}")
 
 
