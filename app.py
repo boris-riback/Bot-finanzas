@@ -88,6 +88,15 @@ def build_prompt_text(catalog: dict, body: str, has_attachment: bool) -> str:
             "- método de pago si está indicado\n"
         )
 
+    body_instruction = ""
+    if not body and has_attachment:
+        body_instruction = (
+            "\nEl usuario envió SOLO un comprobante sin texto. Inferí todo del documento:\n"
+            "- Si es una factura de compra, recibo de pago a proveedor, o transferencia saliente → kind = \"egreso\".\n"
+            "- Si es una factura de venta, cobro, o transferencia entrante → kind = \"ingreso\".\n"
+            "- Extraé todos los datos posibles del comprobante.\n"
+        )
+
     return (
         "Sos un parser de movimientos financieros para un ERP.\n\n"
         "Catálogo disponible para esta organización:\n"
@@ -98,21 +107,27 @@ def build_prompt_text(catalog: dict, body: str, has_attachment: bool) -> str:
         f"- paymentMethods: {json.dumps(catalog.get('paymentMethods', []), ensure_ascii=False)}\n"
         f"- counterparties: {json.dumps(catalog.get('counterparties', []), ensure_ascii=False)}\n"
         f"- receiptTypes: {json.dumps(catalog.get('receiptTypes', []), ensure_ascii=False)}\n"
-        f"{adjunto_block}\n"
+        f"{adjunto_block}"
+        f"{body_instruction}\n"
         f"Fecha de hoy: {today}\n"
         f'Mensaje del usuario: "{body}"\n\n'
         "Devolvé JSON exacto con estos campos:\n"
         "{\n"
         '  "kind": "egreso" | "ingreso",\n'
         '  "classificationId": "<uuid del catálogo>",\n'
+        '  "classificationName": "<nombre legible de la clasificación elegida>",\n'
         '  "conceptId": "<uuid del catálogo>",\n'
+        '  "conceptName": "<nombre legible del concepto elegido>",\n'
         '  "movementTypeId": "<uuid>",\n'
+        '  "movementTypeName": "<nombre legible del tipo de movimiento>",\n'
         '  "paymentMethodId": "<uuid>",\n'
+        '  "paymentMethodName": "<nombre legible del método de pago>",\n'
         '  "counterpartyId": "<uuid si estás 100% seguro que matchea una counterparty del catálogo, si no null>",\n'
         '  "counterpartyName": "<nombre del proveedor que el usuario quiere asociar, null si no hay>",\n'
         '  "counterpartyAliasHints": ["otros nombres razón social vistos en el comprobante que no coinciden con counterpartyName"],\n'
         '  "counterpartyCbu": "<CBU o alias bancario del comprobante si aparece, null si no>",\n'
         '  "businessUnitId": "<uuid>",\n'
+        '  "businessUnitName": "<nombre legible de la unidad de negocio>",\n'
         '  "amount": <number>,\n'
         '  "movementDate": "YYYY-MM-DD (hoy si no se menciona ni en texto ni en el adjunto)",\n'
         '  "status": "pendiente" | "pagado",\n'
@@ -222,15 +237,46 @@ def format_amount(value) -> str:
 
 def format_movement_reply(movement: dict, parsed_fallback: dict | None = None) -> str:
     fb = parsed_fallback or {}
-    kind = movement.get("kind") or fb.get("kind") or ""
+
+    def _get(key, fb_key=None):
+        return movement.get(key) or fb.get(fb_key or key) or ""
+
+    kind = _get("kind")
     amount = movement.get("amount", fb.get("amount", 0))
-    status = movement.get("status") or fb.get("status") or ""
-    cp = movement.get("counterparty_name") or fb.get("counterpartyName") or ""
-    notes = movement.get("notes") or fb.get("notes") or ""
+    status = _get("status")
+    cp = _get("counterparty_name", "counterpartyName")
+    notes = _get("notes")
+    date = _get("movement_date", "movementDate")
+    classification = _get("classification_name", "classificationName")
+    concept = _get("concept_name", "conceptName")
+    payment_method = _get("payment_method_name", "paymentMethodName")
+    business_unit = _get("business_unit_name", "businessUnitName")
+    receipt_number = _get("receipt_number", "receiptNumber")
+
     emoji = "💸" if kind == "egreso" else "💰"
-    suffix = f" a {cp}" if cp else ""
-    head = f"{emoji} {kind} {format_amount(amount)}{suffix} ({status})"
-    return f"{head}\n📝 {notes}" if notes else head
+    lines = [f"{emoji} *{kind.upper()}* {format_amount(amount)}"]
+    if cp:
+        lines.append(f"👤 {cp}")
+    details = []
+    if classification:
+        details.append(classification)
+    if concept:
+        details.append(concept)
+    if details:
+        lines.append(f"🏷️ {' → '.join(details)}")
+    if payment_method:
+        lines.append(f"💳 {payment_method}")
+    if date:
+        lines.append(f"📅 {date}")
+    if business_unit:
+        lines.append(f"🏢 {business_unit}")
+    if receipt_number:
+        lines.append(f"🧾 {receipt_number}")
+    status_emoji = "✅" if status == "pagado" else "⏳"
+    lines.append(f"{status_emoji} {status}")
+    if notes:
+        lines.append(f"📝 {notes}")
+    return "\n".join(lines)
 
 
 def format_candidate_menu(candidates: list, suggested_name: str, suggested_cbu: str) -> str:
@@ -462,17 +508,20 @@ def webhook():
             media_bytes = r.content
             log.info("media downloaded: %d bytes", len(media_bytes))
 
-        # Audio → always async (transcription + parse takes too long for Twilio timeout)
-        if media_bytes and is_audio_mime(media_mime):
-            log.info("audio detected, processing async")
+        # Heavy processing → async (audio transcription, vision, etc.)
+        # Keeps Twilio from timing out; reply sent via REST API
+        needs_async = (media_bytes and is_audio_mime(media_mime)) or media_bytes is not None
+        if needs_async:
+            log.info("heavy processing detected (audio=%s, media=%s), going async",
+                     is_audio_mime(media_mime) if media_mime else False, bool(media_bytes))
             threading.Thread(
                 target=process_async,
                 args=(phone, body, sid, media_bytes, media_mime),
                 daemon=True,
             ).start()
-            return "", 200  # Empty 200 — no TwiML reply, async will send via API
+            return "", 200
 
-        # Text and image/PDF — process synchronously (usually fast enough)
+        # Text-only — process synchronously
         reply_text = process_message(phone, body, sid, media_bytes, media_mime)
         return twilio_reply(reply_text)
 
