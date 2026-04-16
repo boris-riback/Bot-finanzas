@@ -297,9 +297,12 @@ def format_candidate_menu(candidates: list, suggested_name: str, suggested_cbu: 
     for i, c in enumerate(candidates[:5], start=1):
         lines.append(f"{i}. {c.get('name')}")
     next_idx = min(len(candidates), 5) + 1
+    lines.append(f"{next_idx}. Proveedor Varios")
+    next_idx += 1
     if suggested_name:
         lines.append(f"{next_idx}. Crear nuevo: {suggested_name}")
-    lines.append(f"{next_idx + 1}. Cancelar")
+        next_idx += 1
+    lines.append(f"{next_idx}. Cancelar")
     return "\n".join(lines)
 
 
@@ -332,8 +335,13 @@ def handle_pending_reply(phone: str, body: str) -> str | None:
     candidates = pending.get("candidates") or []
     raw_name = pending.get("raw_counterparty_name") or ""
     visible = candidates[:5]
-    create_idx = len(visible) + 1
-    cancel_idx = create_idx + 1
+    next_idx = len(visible) + 1
+    varios_idx = next_idx
+    next_idx += 1
+    create_idx = next_idx if raw_name else None
+    if raw_name:
+        next_idx += 1
+    cancel_idx = next_idx
 
     if 1 <= choice_num <= len(visible):
         cp = visible[choice_num - 1]
@@ -342,13 +350,19 @@ def handle_pending_reply(phone: str, body: str) -> str | None:
             {"kind": "existing", "counterpartyId": cp["id"]},
             pending_id=pending["id"],
         )
-    elif choice_num == create_idx and raw_name:
+    elif choice_num == varios_idx:
+        result = confirm_pending(
+            phone,
+            {"kind": "varios"},
+            pending_id=pending["id"],
+        )
+    elif create_idx and choice_num == create_idx:
         result = confirm_pending(
             phone,
             {"kind": "new", "name": raw_name},
             pending_id=pending["id"],
         )
-    elif choice_num == cancel_idx or (choice_num == create_idx and not raw_name):
+    elif choice_num == cancel_idx:
         result = confirm_pending(phone, {"kind": "cancel"}, pending_id=pending["id"])
         if result.get("cancelled"):
             return twilio_reply("Selección cancelada.")
@@ -435,15 +449,22 @@ def _check_pending(phone: str, text: str) -> str | None:
     candidates = pending.get("candidates") or []
     raw_name = pending.get("raw_counterparty_name") or ""
     visible = candidates[:5]
-    create_idx = len(visible) + 1
-    cancel_idx = create_idx + 1
+    next_idx = len(visible) + 1
+    varios_idx = next_idx
+    next_idx += 1
+    create_idx = next_idx if raw_name else None
+    if raw_name:
+        next_idx += 1
+    cancel_idx = next_idx
 
     if 1 <= choice_num <= len(visible):
         cp = visible[choice_num - 1]
         result = confirm_pending(phone, {"kind": "existing", "counterpartyId": cp["id"]}, pending_id=pending["id"])
-    elif choice_num == create_idx and raw_name:
+    elif choice_num == varios_idx:
+        result = confirm_pending(phone, {"kind": "varios"}, pending_id=pending["id"])
+    elif create_idx and choice_num == create_idx:
         result = confirm_pending(phone, {"kind": "new", "name": raw_name}, pending_id=pending["id"])
-    elif choice_num == cancel_idx or (choice_num == create_idx and not raw_name):
+    elif choice_num == cancel_idx:
         result = confirm_pending(phone, {"kind": "cancel"}, pending_id=pending["id"])
         if result.get("cancelled"):
             return "Selección cancelada."
