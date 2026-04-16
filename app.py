@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import threading
+from collections import defaultdict, deque
 from datetime import datetime
 
 import anthropic
@@ -54,6 +55,28 @@ claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 
+MAX_HISTORY = 10
+conversation_history: dict[str, deque] = defaultdict(lambda: deque(maxlen=MAX_HISTORY))
+
+
+def add_to_history(phone: str, role: str, text: str):
+    conversation_history[phone].append({
+        "role": role,
+        "text": text[:500],
+        "ts": datetime.now().strftime("%H:%M"),
+    })
+
+
+def get_history_text(phone: str) -> str:
+    history = conversation_history.get(phone)
+    if not history:
+        return ""
+    lines = []
+    for entry in history:
+        prefix = "Usuario" if entry["role"] == "user" else "Bot"
+        lines.append(f"[{entry['ts']}] {prefix}: {entry['text']}")
+    return "\n".join(lines)
+
 
 def is_audio_mime(mime: str | None) -> bool:
     return bool(mime) and mime.split(";")[0].strip().lower() in AUDIO_MIME_EXT
@@ -74,7 +97,7 @@ def transcribe_audio(audio_bytes: bytes, mime: str) -> str:
     return (resp.text or "").strip()
 
 
-def build_prompt_text(catalog: dict, body: str, has_attachment: bool) -> str:
+def build_prompt_text(catalog: dict, body: str, has_attachment: bool, phone: str = "") -> str:
     today = datetime.now().strftime("%Y-%m-%d")
     adjunto_block = ""
     if has_attachment:
@@ -154,7 +177,7 @@ def build_prompt_text(catalog: dict, body: str, has_attachment: bool) -> str:
         "  * 'Leyendas adicionales' tienen este orden: (1) nombre del DESTINATARIO, (2) CUIT del destinatario, (3) referencia/concepto libre, (4) banco.\n"
         "  * La primera leyenda es el nombre del destinatario → usalo como counterpartyName.\n"
         "  * La referencia (3ra leyenda, ej: 'VARIOS') NO es el proveedor, es solo un concepto de la transferencia. Ignorala para counterpartyName.\n"
-        "  * El CUIT (2da leyenda) va en notes.\n"
+        "  * El CUIT (2da leyenda) NO va en notes.\n"
         "- Para otros comprobantes bancarios sin formato conocido: si no hay dato claro del destinatario, counterpartyName = null.\n\n"
         "Reglas de resolución texto vs adjunto (cuando hay adjunto):\n"
         "- Monto (amount): gana el adjunto salvo que el texto diga explícitamente otro número.\n"
@@ -165,11 +188,17 @@ def build_prompt_text(catalog: dict, body: str, has_attachment: bool) -> str:
         "- Método de pago y status: gana el texto del usuario.\n"
         "- Número de comprobante: del adjunto.\n"
         "- Si el adjunto es ilegible o no parece un comprobante, ignoralo y parseá solo el texto.\n\n"
+        + (f"Historial reciente de la conversación:\n{get_history_text(phone)}\n\n" if phone and get_history_text(phone) else "")
+        + "Reglas de contexto conversacional:\n"
+        "- Si el usuario hace referencia a un mensaje anterior (\"ese\", \"el último\", \"el de recién\"), usá el historial para entender a qué se refiere.\n"
+        "- Si dice \"fue pagado\", \"ya lo pagué\", \"pagalo\", \"ponelo como pagado\" sin especificar monto ni proveedor, está corrigiendo el último movimiento. Devolvé el JSON con los mismos datos del último movimiento registrado (visible en el historial) pero con status = \"pagado\".\n"
+        "- Si dice \"cambiale el proveedor a X\" o \"era para proveedor X\", devolvé el JSON corrigiendo solo el campo mencionado.\n"
+        "- Si el mensaje es claramente un movimiento nuevo (tiene monto, proveedor, etc.), ignorá el historial y parseá normalmente.\n\n"
         "Respondé SOLO el JSON, sin markdown ni explicación."
     )
 
 
-def claude_parse(body: str, catalog: dict, media_bytes: bytes | None, media_mime: str | None) -> dict:
+def claude_parse(body: str, catalog: dict, media_bytes: bytes | None, media_mime: str | None, phone: str = "") -> dict:
     content_blocks: list = []
 
     if media_bytes and media_mime:
@@ -188,7 +217,7 @@ def claude_parse(body: str, catalog: dict, media_bytes: bytes | None, media_mime
     has_attachment = bool(content_blocks)
     content_blocks.append({
         "type": "text",
-        "text": build_prompt_text(catalog, body, has_attachment=has_attachment),
+        "text": build_prompt_text(catalog, body, has_attachment=has_attachment, phone=phone),
     })
 
     resp = claude.messages.create(
@@ -412,12 +441,16 @@ def process_message(phone: str, body: str, sid: str, media_bytes: bytes | None, 
 
     log.info("fetching catalog")
     catalog = fetch_catalog(phone)
+    add_to_history(phone, "user", body)
+
     log.info("calling claude_parse body=%r", body[:80])
-    parsed = claude_parse(body, catalog, media_bytes, media_mime)
+    parsed = claude_parse(body, catalog, media_bytes, media_mime, phone=phone)
     log.info("parsed: %s", json.dumps(parsed, ensure_ascii=False)[:300])
 
     if "error" in parsed:
-        return f"No pude interpretar: {parsed['error']}"
+        error_reply = f"No pude interpretar: {parsed['error']}"
+        add_to_history(phone, "bot", error_reply)
+        return error_reply
 
     attachment_path = None
     if media_bytes:
@@ -434,16 +467,21 @@ def process_message(phone: str, body: str, sid: str, media_bytes: bytes | None, 
     log.info("ingest result: %s", json.dumps(result, ensure_ascii=False)[:300])
 
     if result.get("status") == "needs_selection":
-        return format_candidate_menu(
+        menu = format_candidate_menu(
             result.get("candidates") or [],
             result.get("suggestedName") or "",
             result.get("suggestedCbu") or "",
         )
+        add_to_history(phone, "bot", menu)
+        return menu
 
     if result.get("duplicated"):
+        add_to_history(phone, "bot", "Movimiento ya registrado previamente.")
         return "Movimiento ya registrado previamente."
 
-    return format_movement_reply(result, parsed)
+    reply = format_movement_reply(result, parsed)
+    add_to_history(phone, "bot", reply)
+    return reply
 
 
 def _check_pending(phone: str, text: str) -> str | None:
