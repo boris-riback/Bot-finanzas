@@ -111,7 +111,7 @@ def build_prompt_text(catalog: dict, body: str, has_attachment: bool) -> str:
         '  "status": "pendiente" | "pagado",\n'
         '  "receiptTypeId": "<uuid o null>",\n'
         '  "receiptNumber": "<string o null>",\n'
-        '  "notes": "<string o null — incluí CUIT acá si lo viste>"\n'
+        '  "notes": "<observación libre del usuario, null si no hay>"\n'
         "}\n\n"
         "Reglas generales:\n"
         '- Si el mensaje menciona "pagado", "cobrado", "ya pagué", "pagué" → status = "pagado".\n'
@@ -120,6 +120,9 @@ def build_prompt_text(catalog: dict, body: str, has_attachment: bool) -> str:
         '- Si el usuario dice "varios" o "proveedor varios", poné counterpartyName: "varios".\n'
         '- Si no se menciona método de pago, usá "Efectivo".\n'
         "- NUNCA inventes UUIDs que no estén en el catálogo.\n"
+        "- notes: capturá toda observación libre del usuario que no sea un campo del catálogo. Ejemplos de disparadores: \"nota:\", \"obs:\", \"observación:\", \"aclaración:\", \"porque\", \"para\", \"es por\", \"corresponde a\", frases entre paréntesis o después de un guión. También sumá el CUIT si aparece.\n"
+        "- Si el usuario dice p.ej. \"egreso 5000 a test por el evento de junio\", notes debe ser \"por el evento de junio\" (NO inventes, solo copiá literal lo relevante).\n"
+        "- Combinalos con \"; \" si hay varios datos (ej: \"CUIT 20-12345678-9; por el evento de junio\").\n"
         '- Si algún campo obligatorio no puede inferirse, respondé con un objeto {"error": "motivo"} en lugar del JSON de movimiento.\n\n'
         "Reglas de resolución texto vs adjunto (cuando hay adjunto):\n"
         "- Monto (amount): gana el adjunto salvo que el texto diga explícitamente otro número.\n"
@@ -207,9 +210,11 @@ def format_movement_reply(movement: dict, parsed_fallback: dict | None = None) -
     amount = movement.get("amount", fb.get("amount", 0))
     status = movement.get("status") or fb.get("status") or ""
     cp = movement.get("counterparty_name") or fb.get("counterpartyName") or ""
+    notes = movement.get("notes") or fb.get("notes") or ""
     emoji = "💸" if kind == "egreso" else "💰"
     suffix = f" a {cp}" if cp else ""
-    return f"{emoji} {kind} {format_amount(amount)}{suffix} ({status})"
+    head = f"{emoji} {kind} {format_amount(amount)}{suffix} ({status})"
+    return f"{head}\n📝 {notes}" if notes else head
 
 
 def format_candidate_menu(candidates: list, suggested_name: str, suggested_cbu: str) -> str:
