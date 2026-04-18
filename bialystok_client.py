@@ -59,3 +59,38 @@ def confirm_pending(phone: str, choice: dict, pending_id: str | None = None) -> 
 
 def fetch_summary(phone: str) -> dict:
     return _post({"action": "summary", "phone": phone})
+
+
+def rrhh_advance(phone: str, origin_ref: str, employee_name: str, amount: float,
+                 date: str | None = None, note: str | None = None) -> dict:
+    payload = {
+        "action": "rrhh_advance",
+        "phone": phone,
+        "originRef": origin_ref,
+        "employeeName": employee_name,
+        "amount": amount,
+    }
+    if date:
+        payload["date"] = date
+    if note:
+        payload["note"] = note
+    return _post(payload)
+
+
+def rrhh_liquidate(phone: str, origin_ref: str, employee_name: str, reference_date: str) -> dict:
+    return _post({
+        "action": "rrhh_liquidate",
+        "phone": phone,
+        "originRef": origin_ref,
+        "employeeName": employee_name,
+        "referenceDate": reference_date,
+    })
+
+
+def rrhh_confirm_liquidation(phone: str, pending_id: str, confirm: bool) -> dict:
+    return _post({
+        "action": "rrhh_confirm_liquidation",
+        "phone": phone,
+        "pendingId": pending_id,
+        "confirm": confirm,
+    })

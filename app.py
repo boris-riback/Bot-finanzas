@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import threading
+import time
 from collections import defaultdict, deque
 from datetime import datetime
 
@@ -21,6 +22,9 @@ from bialystok_client import (
     fetch_summary,
     ingest,
     list_pending,
+    rrhh_advance,
+    rrhh_confirm_liquidation,
+    rrhh_liquidate,
     upload_attachment,
 )
 
@@ -236,6 +240,8 @@ COMMAND_RESPONSES = {
     "/ayuda": (
         "Comandos:\n"
         "- /resumen: pagos pendientes próximos 7 y 30 días\n"
+        "- /adelanto <nombre> <monto> [nota]: registra adelanto a empleado\n"
+        "- /liquidar <nombre>: prepara liquidación semanal (pide SI/NO)\n"
         "- /cancelar: cancela selección pendiente\n\n"
         "Mandá texto libre con foto/PDF/audio para registrar movimiento. "
         "Si aparecen opciones de proveedor, respondé con el número."
@@ -244,6 +250,160 @@ COMMAND_RESPONSES = {
 
 # Commands that need dynamic handling (not static responses)
 DYNAMIC_COMMANDS = {"/resumen"}
+
+
+PENDING_LIQUIDATION_TTL = 1800
+pending_liquidations: dict[str, dict] = {}
+
+LIQ_CONFIRM_WORDS = {"si", "sí", "ok", "confirmar", "dale"}
+LIQ_CANCEL_WORDS = {"no", "cancelar"}
+
+
+def set_pending_liquidation(phone: str, pending_id: str):
+    pending_liquidations[phone] = {
+        "pendingId": pending_id,
+        "expiresAt": time.time() + PENDING_LIQUIDATION_TTL,
+    }
+
+
+def get_pending_liquidation(phone: str) -> dict | None:
+    entry = pending_liquidations.get(phone)
+    if not entry:
+        return None
+    if time.time() > entry["expiresAt"]:
+        pending_liquidations.pop(phone, None)
+        return None
+    return entry
+
+
+def clear_pending_liquidation(phone: str):
+    pending_liquidations.pop(phone, None)
+
+
+ADELANTO_RE = re.compile(r"^/adelanto\b\s*(.*)$", re.IGNORECASE | re.DOTALL)
+LIQUIDAR_RE = re.compile(r"^/liquidar\b\s*(.*)$", re.IGNORECASE | re.DOTALL)
+AMOUNT_RE = re.compile(r"[-+]?\d+(?:[.,]\d+)?")
+
+
+def parse_adelanto(body: str) -> dict | None:
+    m = ADELANTO_RE.match(body.strip())
+    if not m:
+        return None
+    rest = m.group(1).strip()
+    if not rest:
+        return None
+    num = AMOUNT_RE.search(rest)
+    if not num:
+        return None
+    name = rest[: num.start()].strip().rstrip(",")
+    if not name:
+        return None
+    try:
+        amount = float(num.group(0).replace(",", "."))
+    except ValueError:
+        return None
+    note = rest[num.end():].strip() or None
+    return {"name": name, "amount": amount, "note": note}
+
+
+def parse_liquidar(body: str) -> str | None:
+    m = LIQUIDAR_RE.match(body.strip())
+    if not m:
+        return None
+    name = m.group(1).strip()
+    return name or None
+
+
+def _extract_edge_error(e: httpx.HTTPStatusError) -> tuple[str, str]:
+    try:
+        body = e.response.json()
+    except Exception:
+        return "", ""
+    return body.get("error", "") or "", body.get("message", "") or ""
+
+
+def _map_rrhh_error(code: str, msg: str, employee_name: str = "") -> str | None:
+    if code == "duplicate_origin_ref":
+        return None
+    if code == "employee_not_found":
+        ref = employee_name or "ese empleado"
+        return f"No encontré a {ref}. Revisá el nombre o escribilo más completo."
+    if code == "employee_ambiguous":
+        return "Hay varios empleados con ese nombre. Sé más específico."
+    if code == "payroll_mode_not_supported":
+        return "Ese empleado no está en modalidad semanal, no puedo liquidarlo por acá."
+    if code in ("pending_not_found", "pending_expired"):
+        return "No hay liquidación pendiente o ya expiró. Mandá /liquidar <nombre> de nuevo."
+    return msg or "Hubo un error procesando tu pedido."
+
+
+def handle_adelanto(phone: str, sid: str, body: str) -> str:
+    parsed = parse_adelanto(body)
+    if not parsed:
+        return "Formato: /adelanto <nombre> <monto> [nota]"
+    today = datetime.now().strftime("%Y-%m-%d")
+    try:
+        result = rrhh_advance(
+            phone=phone,
+            origin_ref=f"wa:{sid}",
+            employee_name=parsed["name"],
+            amount=parsed["amount"],
+            date=today,
+            note=parsed["note"],
+        )
+    except httpx.HTTPStatusError as e:
+        code, msg = _extract_edge_error(e)
+        mapped = _map_rrhh_error(code, msg, parsed["name"])
+        return mapped or ""
+    return result.get("message") or "✅ Adelanto registrado."
+
+
+def handle_liquidar(phone: str, sid: str, body: str) -> str:
+    name = parse_liquidar(body)
+    if not name:
+        return "Formato: /liquidar <nombre completo>"
+    today = datetime.now().strftime("%Y-%m-%d")
+    try:
+        result = rrhh_liquidate(
+            phone=phone,
+            origin_ref=f"wa:{sid}",
+            employee_name=name,
+            reference_date=today,
+        )
+    except httpx.HTTPStatusError as e:
+        code, msg = _extract_edge_error(e)
+        mapped = _map_rrhh_error(code, msg, name)
+        return mapped or ""
+    pending_id = result.get("pendingId")
+    if pending_id:
+        set_pending_liquidation(phone, pending_id)
+    return result.get("message") or "Liquidación preparada. Respondé SI para confirmar o NO para cancelar."
+
+
+def handle_liquidation_confirmation(phone: str, body: str) -> str | None:
+    """Return reply text if consumed, None to let message follow normal flow."""
+    entry = get_pending_liquidation(phone)
+    if not entry:
+        return None
+    lower = (body or "").strip().lower()
+    if lower in LIQ_CONFIRM_WORDS:
+        confirm = True
+    elif lower in LIQ_CANCEL_WORDS:
+        confirm = False
+    else:
+        clear_pending_liquidation(phone)
+        return None
+    try:
+        result = rrhh_confirm_liquidation(phone, entry["pendingId"], confirm)
+    except httpx.HTTPStatusError as e:
+        clear_pending_liquidation(phone)
+        code, msg = _extract_edge_error(e)
+        if code == "duplicate_origin_ref":
+            return ""
+        return _map_rrhh_error(code, msg) or ""
+    clear_pending_liquidation(phone)
+    default = "✅ Liquidación confirmada." if confirm else "Liquidación cancelada."
+    return result.get("message") or default
 
 
 def format_summary_section(title: str, items: list, total: float) -> str:
@@ -301,6 +461,44 @@ def format_amount(value) -> str:
         return str(value)
 
 
+def extract_receipt_info(result: dict | None) -> dict | None:
+    """Detect backend-generated receipt in ingest/confirm response.
+
+    Returns {"id", "number", "url"} when present, else None.
+    Shape: either result["receipt"] = {...} or result["receiptGenerated"] = True.
+    """
+    if not isinstance(result, dict):
+        return None
+    receipt = result.get("receipt")
+    if isinstance(receipt, dict):
+        return {
+            "id": receipt.get("id"),
+            "number": receipt.get("number"),
+            "url": receipt.get("url") or receipt.get("pdfUrl"),
+        }
+    if result.get("receiptGenerated"):
+        return {"id": None, "number": None, "url": None}
+    return None
+
+
+def format_receipt_line(result: dict | None) -> str:
+    info = extract_receipt_info(result)
+    if not info:
+        return ""
+    number = info.get("number")
+    if number:
+        return f"🧾 Comprobante #{number} generado"
+    return "🧾 Comprobante generado"
+
+
+def log_receipt(result: dict | None):
+    info = extract_receipt_info(result)
+    if info:
+        log.info("receipt generated | id=%s number=%s", info.get("id"), info.get("number"))
+    else:
+        log.info("receipt not generated")
+
+
 def format_movement_reply(movement: dict, parsed_fallback: dict | None = None) -> str:
     fb = parsed_fallback or {}
 
@@ -329,7 +527,23 @@ def format_movement_reply(movement: dict, parsed_fallback: dict | None = None) -
         lines.append(f"📅 {date}")
     if notes:
         lines.append(f"📝 {notes}")
+    receipt_line = format_receipt_line(movement)
+    if receipt_line:
+        lines.append(receipt_line)
     return "\n".join(lines)
+
+
+def format_duplicate_reply(result: dict | None) -> str:
+    """Reply for a deduped ingest: header + movement details (+ receipt line if present)."""
+    header = "⚠️ Movimiento ya registrado previamente."
+    if not isinstance(result, dict):
+        return header
+    has_content = any(
+        result.get(k) for k in ("kind", "amount", "counterparty_name", "counterpartyName")
+    )
+    if not has_content:
+        return header
+    return f"{header}\n{format_movement_reply(result)}"
 
 
 def format_candidate_menu(candidates: list, suggested_name: str, suggested_cbu: str) -> str:
@@ -419,7 +633,9 @@ def handle_pending_reply(phone: str, body: str) -> str | None:
         return twilio_reply("Opción inválida. Respondé con un número del menú o /cancelar.")
 
     if result.get("duplicated"):
-        return twilio_reply("Movimiento ya registrado previamente.")
+        log_receipt(result)
+        return twilio_reply(format_duplicate_reply(result))
+    log_receipt(result)
     return twilio_reply(format_movement_reply(result))
 
 
@@ -466,6 +682,7 @@ def process_message(phone: str, body: str, sid: str, media_bytes: bytes | None, 
         **parsed,
     })
     log.info("ingest result: %s", json.dumps(result, ensure_ascii=False)[:300])
+    log_receipt(result)
 
     if result.get("status") == "needs_selection":
         menu = format_candidate_menu(
@@ -477,8 +694,9 @@ def process_message(phone: str, body: str, sid: str, media_bytes: bytes | None, 
         return menu
 
     if result.get("duplicated"):
-        add_to_history(phone, "bot", "Movimiento ya registrado previamente.")
-        return "Movimiento ya registrado previamente."
+        dup_reply = format_duplicate_reply(result)
+        add_to_history(phone, "bot", dup_reply)
+        return dup_reply
 
     reply = format_movement_reply(result, parsed)
     add_to_history(phone, "bot", reply)
@@ -530,7 +748,9 @@ def _check_pending(phone: str, text: str) -> str | None:
         return "Opción inválida. Respondé con un número del menú o /cancelar."
 
     if result.get("duplicated"):
-        return "Movimiento ya registrado previamente."
+        log_receipt(result)
+        return format_duplicate_reply(result)
+    log_receipt(result)
     return format_movement_reply(result)
 
 
@@ -571,6 +791,25 @@ def webhook():
     try:
         # Quick sync replies: pending selection or commands (no heavy processing)
         if not media_url and body:
+            # Liquidation confirmation (si/no/ok/cancelar) if pendingId active
+            liq_reply = handle_liquidation_confirmation(phone, body)
+            if liq_reply is not None:
+                if liq_reply == "":
+                    return "", 200
+                return twilio_reply(liq_reply)
+
+            lower_body = body.strip().lower()
+            if lower_body.startswith("/adelanto"):
+                reply = handle_adelanto(phone, sid, body)
+                if not reply:
+                    return "", 200
+                return twilio_reply(reply)
+            if lower_body.startswith("/liquidar"):
+                reply = handle_liquidar(phone, sid, body)
+                if not reply:
+                    return "", 200
+                return twilio_reply(reply)
+
             pending_reply = handle_pending_reply(phone, body)
             if pending_reply is not None:
                 return pending_reply
