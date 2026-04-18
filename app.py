@@ -161,7 +161,8 @@ def build_prompt_text(catalog: dict, body: str, has_attachment: bool, phone: str
         "}\n\n"
         "Reglas generales:\n"
         '- Si el mensaje menciona "pagado", "cobrado", "ya pagué", "pagué" → status = "pagado".\n'
-        '- Si menciona "pendiente", "por pagar", "a pagar", o no especifica → status = "pendiente".\n'
+        '- Si menciona "pendiente", "por pagar", "a pagar" → status = "pendiente".\n'
+        '- Si no especifica estado → status = "pagado" (default).\n'
         "- counterpartyId: devolvé null salvo que el nombre coincida EXACTAMENTE con uno del catálogo. Si hay duda, null y poné el nombre crudo en counterpartyName.\n"
         '- Si el usuario dice "varios" o "proveedor varios" en el TEXTO, poné counterpartyName: "varios". Pero si "VARIOS" aparece solo en el comprobante como referencia/leyenda bancaria, NO es el proveedor — dejá counterpartyName en null.\n'
         '- Si no se menciona método de pago, usá "Efectivo".\n'
