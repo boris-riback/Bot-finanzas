@@ -94,3 +94,31 @@ def rrhh_confirm_liquidation(phone: str, pending_id: str, confirm: bool) -> dict
         "pendingId": pending_id,
         "confirm": confirm,
     })
+
+
+def internal_transfer(phone: str, origin_ref: str, from_cash_box: str, to_cash_box: str,
+                      amount: float, transfer_date: str, reason: str | None = None,
+                      notes: str | None = None) -> dict:
+    payload = {
+        "action": "internal_transfer",
+        "phone": phone,
+        "originRef": origin_ref,
+        "fromCashBoxName": from_cash_box,
+        "toCashBoxName": to_cash_box,
+        "amount": amount,
+        "transferDate": transfer_date,
+    }
+    if reason:
+        payload["reason"] = reason
+    if notes:
+        payload["notes"] = notes
+    return _post(payload)
+
+
+def confirm_transfer_pending(phone: str, pending_id: str, choice: dict) -> dict:
+    return _post({
+        "action": "confirm_transfer_pending",
+        "phone": phone,
+        "pendingId": pending_id,
+        "choice": choice,
+    })

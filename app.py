@@ -18,9 +18,11 @@ from twilio.twiml.messaging_response import MessagingResponse
 
 from bialystok_client import (
     confirm_pending,
+    confirm_transfer_pending,
     fetch_catalog,
     fetch_summary,
     ingest,
+    internal_transfer,
     list_pending,
     rrhh_advance,
     rrhh_confirm_liquidation,
@@ -135,11 +137,24 @@ def build_prompt_text(catalog: dict, body: str, has_attachment: bool, phone: str
         f"- paymentMethods: {json.dumps(catalog.get('paymentMethods', []), ensure_ascii=False)}\n"
         f"- counterparties: {json.dumps(catalog.get('counterparties', []), ensure_ascii=False)}\n"
         f"- receiptTypes: {json.dumps(catalog.get('receiptTypes', []), ensure_ascii=False)}\n"
+        f"- cashBoxes: {json.dumps(catalog.get('cashBoxes', []), ensure_ascii=False)}\n"
         f"{adjunto_block}"
         f"{body_instruction}\n"
         f"Fecha de hoy: {today}\n"
         f'Mensaje del usuario: "{body}"\n\n'
-        "Devolvé JSON exacto con estos campos:\n"
+        "Decidí primero el TIPO de operación:\n"
+        "- \"egreso\" | \"ingreso\": pago/cobro real (plata entró o salió, o queda como pendiente contra una contraparte).\n"
+        "- \"transferencia\": movimiento interno entre dos cajas/cuentas propias. Disparadores: \"transferí X de [caja1] a [caja2]\", \"moví/pasé X de [caja1] a [caja2]\", \"transferencia interna\". NO hay contraparte.\n\n"
+        "Si es transferencia, devolvé JSON:\n"
+        "{\n"
+        '  "kind": "transferencia",\n'
+        '  "fromCashBoxName": "<nombre de la caja origen, como lo escribió el usuario o matcheado al catálogo cashBoxes>",\n'
+        '  "toCashBoxName": "<nombre de la caja destino>",\n'
+        '  "amount": <number>,\n'
+        '  "movementDate": "YYYY-MM-DD (hoy si no se menciona)",\n'
+        '  "notes": "<texto libre extra del usuario, null si no hay>"\n'
+        "}\n\n"
+        "Si es egreso o ingreso, devolvé JSON con estos campos:\n"
         "{\n"
         '  "kind": "egreso" | "ingreso",\n'
         '  "classificationId": "<uuid del catálogo>",\n'
@@ -530,6 +545,8 @@ def format_movement_reply(movement: dict, parsed_fallback: dict | None = None) -
     receipt_line = format_receipt_line(movement)
     if receipt_line:
         lines.append(receipt_line)
+    if movement.get("needs_counterparty"):
+        lines.append(f"⚠ Completá el {_counterparty_label(kind)} desde la app")
     return "\n".join(lines)
 
 
@@ -546,25 +563,85 @@ def format_duplicate_reply(result: dict | None) -> str:
     return f"{header}\n{format_movement_reply(result)}"
 
 
-def format_candidate_menu(candidates: list, suggested_name: str, suggested_cbu: str) -> str:
-    lines = []
-    if suggested_cbu:
-        lines.append(f'No reconocí el proveedor de "{suggested_name or suggested_cbu}".')
-    elif suggested_name:
-        lines.append(f'No reconocí al proveedor "{suggested_name}".')
-    else:
-        lines.append("No encontré proveedor.")
+def _counterparty_label(kind: str) -> str:
+    return "cliente" if kind == "ingreso" else "proveedor"
+
+
+def _build_menu_indexes(candidates: list, raw_name: str) -> dict:
+    """Compute numeric menu indexes for pending selection.
+
+    Shape: {varios, create (or None), skip, cancel, visible_count}.
+    Keeps handle_pending_reply and _check_pending in sync.
+    """
+    visible_count = min(len(candidates or []), 5)
+    next_idx = visible_count + 1
+    varios_idx = next_idx
+    next_idx += 1
+    create_idx = next_idx if raw_name else None
+    if raw_name:
+        next_idx += 1
+    skip_idx = next_idx
+    next_idx += 1
+    cancel_idx = next_idx
+    return {
+        "visible_count": visible_count,
+        "varios": varios_idx,
+        "create": create_idx,
+        "skip": skip_idx,
+        "cancel": cancel_idx,
+    }
+
+
+def format_transfer_candidate_menu(candidates: list, raw_name: str, unresolved_slot: str) -> str:
+    slot_label = "origen" if unresolved_slot == "from" else "destino"
+    lines = [f'No identifiqué la caja {slot_label} "{raw_name}".']
     lines.append("")
     lines.append("¿Cuál es? Respondé con el número:")
-    for i, c in enumerate(candidates[:5], start=1):
+    for i, c in enumerate((candidates or [])[:5], start=1):
         lines.append(f"{i}. {c.get('name')}")
-    next_idx = min(len(candidates), 5) + 1
-    lines.append(f"{next_idx}. Proveedor Varios")
-    next_idx += 1
-    if suggested_name:
-        lines.append(f"{next_idx}. Crear nuevo: {suggested_name}")
-        next_idx += 1
-    lines.append(f"{next_idx}. Cancelar")
+    cancel_idx = min(len(candidates or []), 5) + 1
+    lines.append(f"{cancel_idx}. Cancelar")
+    return "\n".join(lines)
+
+
+def format_transfer_reply(result: dict) -> str:
+    from_name = result.get("from_cash_box_name") or result.get("fromCashBoxName") or ""
+    to_name = result.get("to_cash_box_name") or result.get("toCashBoxName") or ""
+    amount = result.get("amount", 0)
+    date = result.get("transfer_date") or result.get("transferDate") or ""
+    notes = result.get("notes") or ""
+    header = "⚠️ Transferencia ya registrada." if result.get("duplicated") else "🔄 *TRANSFERENCIA*"
+    lines = [f"{header} {format_amount(amount)}"]
+    if from_name or to_name:
+        lines.append(f"📤 {from_name} → 📥 {to_name}")
+    if date:
+        lines.append(f"📅 {date}")
+    if notes:
+        lines.append(f"📝 {notes}")
+    return "\n".join(lines)
+
+
+def format_candidate_menu(candidates: list, suggested_name: str, suggested_cbu: str, kind: str = "egreso") -> str:
+    label = _counterparty_label(kind)
+    article = "la" if label == "cliente" else "al"
+    lines = []
+    if suggested_cbu:
+        lines.append(f'No reconocí el {label} de "{suggested_name or suggested_cbu}".')
+    elif suggested_name:
+        lines.append(f'No reconocí {article} {label} "{suggested_name}".')
+    else:
+        lines.append(f"No encontré {label}.")
+    lines.append("")
+    lines.append("¿Cuál es? Respondé con el número:")
+    for i, c in enumerate((candidates or [])[:5], start=1):
+        lines.append(f"{i}. {c.get('name')}")
+    idx = _build_menu_indexes(candidates, suggested_name)
+    varios_label = "Cliente Varios" if label == "cliente" else "Proveedor Varios"
+    lines.append(f"{idx['varios']}. {varios_label}")
+    if idx["create"]:
+        lines.append(f"{idx['create']}. Crear nuevo: {suggested_name}")
+    lines.append(f"{idx['skip']}. Dejar en blanco (completar después)")
+    lines.append(f"{idx['cancel']}. Cancelar")
     return "\n".join(lines)
 
 
@@ -576,13 +653,39 @@ def try_parse_numeric(body: str) -> int | None:
     return int(m.group(1)) if m else None
 
 
-def handle_pending_reply(phone: str, body: str) -> str | None:
-    """Return twilio reply string if this message resolves a pending selection; else None."""
+def _resolve_transfer_pending(phone: str, choice_num: int, pending_transfer: dict) -> str:
+    """Resolve a numeric reply against a pending transfer. Returns reply text."""
+    candidates = pending_transfer.get("candidates") or []
+    visible = candidates[:5]
+    cancel_idx = len(visible) + 1
+
+    if 1 <= choice_num <= len(visible):
+        chosen = visible[choice_num - 1]
+        result = confirm_transfer_pending(
+            phone,
+            pending_transfer["id"],
+            {"kind": "select", "cashBoxId": chosen["id"]},
+        )
+    elif choice_num == cancel_idx:
+        result = confirm_transfer_pending(phone, pending_transfer["id"], {"kind": "cancel"})
+        if result.get("cancelled"):
+            return "Transferencia cancelada."
+        return "No pude cancelar."
+    else:
+        return "Opción inválida. Respondé con un número del menú o /cancelar."
+
+    return format_transfer_reply(result)
+
+
+def _resolve_pending_choice(phone: str, body: str) -> str | None:
+    """Core pending-selection resolver. Returns plain reply text, or None if
+    the message does not resolve a pending selection."""
     lower = (body or "").strip().lower()
     if lower == "/cancelar":
+        # Try movement pending first, fallback to transfer pending
         resp = confirm_pending(phone, {"kind": "cancel"})
         if resp.get("cancelled"):
-            return twilio_reply("Selección cancelada.")
+            return "Selección cancelada."
         return None
 
     choice_num = try_parse_numeric(body)
@@ -591,52 +694,52 @@ def handle_pending_reply(phone: str, body: str) -> str | None:
 
     pending_resp = list_pending(phone)
     pending = pending_resp.get("pending")
-    if not pending:
-        return None
+    pending_transfer = pending_resp.get("pendingTransfer") or pending_resp.get("pending_transfer")
 
-    candidates = pending.get("candidates") or []
-    raw_name = pending.get("raw_counterparty_name") or ""
-    visible = candidates[:5]
-    next_idx = len(visible) + 1
-    varios_idx = next_idx
-    next_idx += 1
-    create_idx = next_idx if raw_name else None
-    if raw_name:
-        next_idx += 1
-    cancel_idx = next_idx
+    if pending:
+        candidates = pending.get("candidates") or []
+        raw_name = pending.get("raw_counterparty_name") or ""
+        idx = _build_menu_indexes(candidates, raw_name)
+        visible = candidates[: idx["visible_count"]]
 
-    if 1 <= choice_num <= len(visible):
-        cp = visible[choice_num - 1]
-        result = confirm_pending(
-            phone,
-            {"kind": "existing", "counterpartyId": cp["id"]},
-            pending_id=pending["id"],
-        )
-    elif choice_num == varios_idx:
-        result = confirm_pending(
-            phone,
-            {"kind": "varios"},
-            pending_id=pending["id"],
-        )
-    elif create_idx and choice_num == create_idx:
-        result = confirm_pending(
-            phone,
-            {"kind": "new", "name": raw_name},
-            pending_id=pending["id"],
-        )
-    elif choice_num == cancel_idx:
-        result = confirm_pending(phone, {"kind": "cancel"}, pending_id=pending["id"])
-        if result.get("cancelled"):
-            return twilio_reply("Selección cancelada.")
-        return twilio_reply("No pude cancelar.")
-    else:
-        return twilio_reply("Opción inválida. Respondé con un número del menú o /cancelar.")
+        if 1 <= choice_num <= idx["visible_count"]:
+            cp = visible[choice_num - 1]
+            result = confirm_pending(
+                phone,
+                {"kind": "existing", "counterpartyId": cp["id"]},
+                pending_id=pending["id"],
+            )
+        elif choice_num == idx["varios"]:
+            result = confirm_pending(phone, {"kind": "varios"}, pending_id=pending["id"])
+        elif idx["create"] and choice_num == idx["create"]:
+            result = confirm_pending(phone, {"kind": "new", "name": raw_name}, pending_id=pending["id"])
+        elif choice_num == idx["skip"]:
+            result = confirm_pending(phone, {"kind": "skip"}, pending_id=pending["id"])
+        elif choice_num == idx["cancel"]:
+            result = confirm_pending(phone, {"kind": "cancel"}, pending_id=pending["id"])
+            if result.get("cancelled"):
+                return "Selección cancelada."
+            return "No pude cancelar."
+        else:
+            return "Opción inválida. Respondé con un número del menú o /cancelar."
 
-    if result.get("duplicated"):
         log_receipt(result)
-        return twilio_reply(format_duplicate_reply(result))
-    log_receipt(result)
-    return twilio_reply(format_movement_reply(result))
+        if result.get("duplicated"):
+            return format_duplicate_reply(result)
+        return format_movement_reply(result)
+
+    if pending_transfer:
+        return _resolve_transfer_pending(phone, choice_num, pending_transfer)
+
+    return None
+
+
+def handle_pending_reply(phone: str, body: str) -> str | None:
+    """Return twilio reply string if this message resolves a pending selection; else None."""
+    reply = _resolve_pending_choice(phone, body)
+    if reply is None:
+        return None
+    return twilio_reply(reply)
 
 
 def process_message(phone: str, body: str, sid: str, media_bytes: bytes | None, media_mime: str | None):
@@ -669,6 +772,30 @@ def process_message(phone: str, body: str, sid: str, media_bytes: bytes | None, 
         add_to_history(phone, "bot", error_reply)
         return error_reply
 
+    if parsed.get("kind") == "transferencia":
+        log.info("routing to internal_transfer")
+        result = internal_transfer(
+            phone=phone,
+            origin_ref=sid,
+            from_cash_box=parsed.get("fromCashBoxName") or "",
+            to_cash_box=parsed.get("toCashBoxName") or "",
+            amount=float(parsed.get("amount") or 0),
+            transfer_date=parsed.get("movementDate") or datetime.now().strftime("%Y-%m-%d"),
+            notes=parsed.get("notes"),
+        )
+        log.info("internal_transfer result: %s", json.dumps(result, ensure_ascii=False)[:300])
+        if result.get("status") == "needs_selection_transfer":
+            menu = format_transfer_candidate_menu(
+                result.get("candidates") or [],
+                result.get("rawName") or "",
+                result.get("unresolvedSlot") or "from",
+            )
+            add_to_history(phone, "bot", menu)
+            return menu
+        reply = format_transfer_reply(result)
+        add_to_history(phone, "bot", reply)
+        return reply
+
     attachment_path = None
     if media_bytes:
         log.info("uploading attachment")
@@ -689,6 +816,7 @@ def process_message(phone: str, body: str, sid: str, media_bytes: bytes | None, 
             result.get("candidates") or [],
             result.get("suggestedName") or "",
             result.get("suggestedCbu") or "",
+            kind=parsed.get("kind") or "egreso",
         )
         add_to_history(phone, "bot", menu)
         return menu
@@ -705,53 +833,7 @@ def process_message(phone: str, body: str, sid: str, media_bytes: bytes | None, 
 
 def _check_pending(phone: str, text: str) -> str | None:
     """Check if text resolves a pending selection. Returns reply text or None."""
-    lower = text.strip().lower()
-    if lower == "/cancelar":
-        resp = confirm_pending(phone, {"kind": "cancel"})
-        if resp.get("cancelled"):
-            return "Selección cancelada."
-        return None
-
-    choice_num = try_parse_numeric(text)
-    if choice_num is None:
-        return None
-
-    pending_resp = list_pending(phone)
-    pending = pending_resp.get("pending")
-    if not pending:
-        return None
-
-    candidates = pending.get("candidates") or []
-    raw_name = pending.get("raw_counterparty_name") or ""
-    visible = candidates[:5]
-    next_idx = len(visible) + 1
-    varios_idx = next_idx
-    next_idx += 1
-    create_idx = next_idx if raw_name else None
-    if raw_name:
-        next_idx += 1
-    cancel_idx = next_idx
-
-    if 1 <= choice_num <= len(visible):
-        cp = visible[choice_num - 1]
-        result = confirm_pending(phone, {"kind": "existing", "counterpartyId": cp["id"]}, pending_id=pending["id"])
-    elif choice_num == varios_idx:
-        result = confirm_pending(phone, {"kind": "varios"}, pending_id=pending["id"])
-    elif create_idx and choice_num == create_idx:
-        result = confirm_pending(phone, {"kind": "new", "name": raw_name}, pending_id=pending["id"])
-    elif choice_num == cancel_idx:
-        result = confirm_pending(phone, {"kind": "cancel"}, pending_id=pending["id"])
-        if result.get("cancelled"):
-            return "Selección cancelada."
-        return "No pude cancelar."
-    else:
-        return "Opción inválida. Respondé con un número del menú o /cancelar."
-
-    if result.get("duplicated"):
-        log_receipt(result)
-        return format_duplicate_reply(result)
-    log_receipt(result)
-    return format_movement_reply(result)
+    return _resolve_pending_choice(phone, text)
 
 
 def process_async(phone, body, sid, media_bytes, media_mime):
