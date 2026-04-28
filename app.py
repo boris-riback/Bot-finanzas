@@ -111,6 +111,7 @@ def build_prompt_text(catalog: dict, body: str, has_attachment: bool, phone: str
             "\nSe adjunta un comprobante (PDF o imagen). Miralo y extraé:\n"
             "- monto total (amount)\n"
             "- fecha del comprobante (movementDate)\n"
+            "- fecha de vencimiento / pago futuro (dueDate) — típico en cheques electrónicos (eCheq), cheques comunes, facturas con plazo de pago\n"
             "- razón social / proveedor / contraparte\n"
             "- CUIT si está visible\n"
             "- CBU o alias bancario destino si aparece (counterpartyCbu)\n"
@@ -173,6 +174,7 @@ def build_prompt_text(catalog: dict, body: str, has_attachment: bool, phone: str
         '  "businessUnitName": "<nombre legible de la unidad de negocio>",\n'
         '  "amount": <number>,\n'
         '  "movementDate": "YYYY-MM-DD (hoy si no se menciona ni en texto ni en el adjunto)",\n'
+        '  "dueDate": "<YYYY-MM-DD fecha de vencimiento si aparece (eCheq, cheque, factura con plazo). null si no hay.>",\n'
         '  "status": "pendiente" | "pagado",\n'
         '  "receiptTypeId": "<uuid o null>",\n'
         '  "receiptNumber": "<string o null>",\n'
@@ -192,6 +194,11 @@ def build_prompt_text(catalog: dict, body: str, has_attachment: bool, phone: str
         "- Si el usuario dice p.ej. \"egreso 5000 a test por el evento de junio\", notes debe ser \"por el evento de junio\" (NO inventes, solo copiá literal lo relevante).\n"
         '- Si algún campo obligatorio no puede inferirse, respondé con un objeto {"error": "motivo"} en lugar del JSON de movimiento.\n\n'
         "Reglas de lectura de comprobantes bancarios:\n"
+        "- Cheque electrónico (eCheq) o cheque común:\n"
+        "  * paymentMethod debe matchear el catálogo (variantes: 'Cheque', 'eCheq', 'Cheque Electrónico'). Si no hay match, usá el más cercano del catálogo paymentMethods.\n"
+        "  * dueDate = fecha de PAGO/VENCIMIENTO del cheque (la fecha en que se cobra). NO uses la fecha de emisión acá — esa va en movementDate.\n"
+        "  * Si el cheque es al día y solo hay una fecha visible, dueDate = movementDate.\n"
+        "  * status = 'pendiente' si el cheque está a fecha futura respecto a hoy, 'pagado' si ya venció o fue depositado.\n"
         "- 'Trf Inmed Proveed' (Transferencia Inmediata a Proveedor) de Banco Galicia y similares:\n"
         "  * kind = 'egreso', paymentMethod = 'Transferencia', status = 'pagado'.\n"
         "  * 'Leyendas adicionales' tienen este orden: (1) nombre del DESTINATARIO, (2) CUIT del destinatario, (3) referencia/concepto libre, (4) banco.\n"
@@ -526,6 +533,7 @@ def format_movement_reply(movement: dict, parsed_fallback: dict | None = None) -
     cp = _get("counterparty_name", "counterpartyName")
     notes = _get("notes")
     date = _get("movement_date", "movementDate")
+    due_date = _get("due_date", "dueDate")
     classification = _get("classification_name", "classificationName")
     concept = _get("concept_name", "conceptName")
     payment_method = _get("payment_method_name", "paymentMethodName")
@@ -540,6 +548,8 @@ def format_movement_reply(movement: dict, parsed_fallback: dict | None = None) -
         lines.append(f"💳 {payment_method}")
     if date:
         lines.append(f"📅 {date}")
+    if due_date and due_date != date:
+        lines.append(f"⏰ Vence: {due_date}")
     if notes:
         lines.append(f"📝 {notes}")
     receipt_line = format_receipt_line(movement)
