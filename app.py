@@ -43,6 +43,27 @@ OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 
 IMAGE_MIMES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
 PDF_MIMES = {"application/pdf"}
+
+# Espejo del marcador que usa la app web (src/shared/lib/treasuryChecks.js)
+# para serializar el numero de cheque dentro de movements.notes. El backend
+# (edge function whatsapp-bot-ingest) lo embebe al recibir chequeNumber;
+# aca lo parseamos al armar la respuesta para mostrar el numero limpio.
+CHEQUE_NOTE_MARKER = "[[APP_BIALYSTOK_CHEQUE:"
+CHEQUE_NOTE_SUFFIX = "]]"
+
+
+def parse_movement_notes_with_cheque(notes: str | None) -> tuple[str, str]:
+    """Devuelve (cheque_number, notes_clean) del campo notes."""
+    raw = (notes or "")
+    stripped = raw.lstrip()
+    if not stripped.startswith(CHEQUE_NOTE_MARKER):
+        return "", raw.strip()
+    marker_end = stripped.find(CHEQUE_NOTE_SUFFIX)
+    if marker_end == -1:
+        return "", raw.strip()
+    cheque = stripped[len(CHEQUE_NOTE_MARKER):marker_end].strip()
+    rest = stripped[marker_end + len(CHEQUE_NOTE_SUFFIX):].lstrip()
+    return cheque, rest.strip()
 AUDIO_MIME_EXT = {
     "audio/ogg": "ogg",
     "audio/opus": "ogg",
@@ -116,6 +137,7 @@ def build_prompt_text(catalog: dict, body: str, has_attachment: bool, phone: str
             "- CUIT si está visible\n"
             "- CBU o alias bancario destino si aparece (counterpartyCbu)\n"
             "- tipo y número de comprobante (Factura A/B/C, Recibo, Ticket, Transferencia, etc.)\n"
+            "- número de cheque / eCheq si aparece (chequeNumber)\n"
             "- método de pago si está indicado\n"
         )
 
@@ -178,6 +200,7 @@ def build_prompt_text(catalog: dict, body: str, has_attachment: bool, phone: str
         '  "status": "pendiente" | "pagado",\n'
         '  "receiptTypeId": "<uuid o null>",\n'
         '  "receiptNumber": "<string o null>",\n'
+        '  "chequeNumber": "<string o null — solo si el adjunto es un cheque/eCheq>",\n'
         '  "notes": "<observación libre del usuario, null si no hay>"\n'
         "}\n\n"
         "Reglas generales:\n"
@@ -199,6 +222,7 @@ def build_prompt_text(catalog: dict, body: str, has_attachment: bool, phone: str
         "  * dueDate = fecha de PAGO/VENCIMIENTO del cheque (la fecha en que se cobra). NO uses la fecha de emisión acá — esa va en movementDate.\n"
         "  * Si el cheque es al día y solo hay una fecha visible, dueDate = movementDate.\n"
         "  * status = 'pendiente' si el cheque está a fecha futura respecto a hoy, 'pagado' si ya venció o fue depositado.\n"
+        "  * chequeNumber = número de cheque / eCheq tal como aparece en el adjunto. En un eCheq suele estar como 'Número de cheque', 'N°' o 'Nro', generalmente 7-8 dígitos. En un cheque físico está impreso arriba a la derecha. Solo dígitos, sin guiones ni espacios. Si no aparece, null.\n"
         "- 'Trf Inmed Proveed' (Transferencia Inmediata a Proveedor) de Banco Galicia y similares:\n"
         "  * kind = 'egreso', paymentMethod = 'Transferencia', status = 'pagado'.\n"
         "  * 'Leyendas adicionales' tienen este orden: (1) nombre del DESTINATARIO, (2) CUIT del destinatario, (3) referencia/concepto libre, (4) banco.\n"
@@ -540,18 +564,22 @@ def format_movement_reply(movement: dict, parsed_fallback: dict | None = None) -
     business_unit = _get("business_unit_name", "businessUnitName")
     receipt_number = _get("receipt_number", "receiptNumber")
 
+    cheque_number, notes_clean = parse_movement_notes_with_cheque(notes)
+
     emoji = "💸" if kind == "egreso" else "💰"
     lines = [f"{emoji} *{kind.upper()}* {format_amount(amount)}"]
     if cp:
         lines.append(f"👤 {cp}")
     if payment_method:
         lines.append(f"💳 {payment_method}")
+    if cheque_number:
+        lines.append(f"🔢 Cheque N° {cheque_number}")
     if date:
         lines.append(f"📅 {date}")
     if due_date and due_date != date:
         lines.append(f"⏰ Vence: {due_date}")
-    if notes:
-        lines.append(f"📝 {notes}")
+    if notes_clean:
+        lines.append(f"📝 {notes_clean}")
     receipt_line = format_receipt_line(movement)
     if receipt_line:
         lines.append(receipt_line)
