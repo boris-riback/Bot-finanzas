@@ -57,6 +57,15 @@ def confirm_pending(phone: str, choice: dict, pending_id: str | None = None) -> 
     return _post(payload)
 
 
+def confirm_comprobante_pending(phone: str, pending_id: str, choice: dict) -> dict:
+    return _post({
+        "action": "confirm_comprobante_pending",
+        "phone": phone,
+        "pendingId": pending_id,
+        "choice": choice,
+    })
+
+
 def fetch_summary(phone: str) -> dict:
     return _post({"action": "summary", "phone": phone})
 

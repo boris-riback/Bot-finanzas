@@ -17,6 +17,7 @@ from twilio.rest import Client as TwilioClient
 from twilio.twiml.messaging_response import MessagingResponse
 
 from bialystok_client import (
+    confirm_comprobante_pending,
     confirm_pending,
     confirm_transfer_pending,
     fetch_catalog,
@@ -537,6 +538,45 @@ def format_receipt_line(result: dict | None) -> str:
     return "🧾 Comprobante generado"
 
 
+def format_imputation_line(result: dict | None) -> str:
+    if not isinstance(result, dict):
+        return ""
+    match = result.get("comprobanteMatch") or result.get("comprobante_match")
+    if not isinstance(match, dict) or match.get("status") != "imputed":
+        return ""
+    imputation = match.get("imputation") or {}
+    count = int(imputation.get("count") or 0)
+    total = imputation.get("total") or 0
+    if count <= 0:
+        return ""
+    label = "comprobante" if count == 1 else "comprobantes"
+    return f"🧾 Imputado a {count} {label} ({format_amount(total)})"
+
+
+def _format_comprobante_option(option: dict, idx: int) -> str:
+    items = option.get("items") or []
+    total = option.get("total") or sum(float(i.get("amountPending") or 0) for i in items)
+    labels = []
+    for item in items:
+        doc = " ".join(str(x or "").strip() for x in [item.get("receiptType"), item.get("receiptNumber")]).strip()
+        labels.append(doc or item.get("counterpartyName") or "Comprobante")
+    return f"{idx}. {format_amount(total)} → {', '.join(labels[:3])}"
+
+
+def format_comprobante_match_menu(match: dict | None) -> str:
+    if not isinstance(match, dict) or match.get("status") != "needs_comprobante_selection":
+        return ""
+    options = match.get("options") or []
+    visible = options[:5]
+    lines = ["Encontré varias formas de imputar este pago."]
+    lines.append("")
+    lines.append("¿Cuál corresponde? Respondé con el número:")
+    for idx, option in enumerate(visible, start=1):
+        lines.append(_format_comprobante_option(option, idx))
+    lines.append(f"{len(visible) + 1}. No imputar ahora")
+    return "\n".join(lines)
+
+
 def log_receipt(result: dict | None):
     info = extract_receipt_info(result)
     if info:
@@ -583,6 +623,9 @@ def format_movement_reply(movement: dict, parsed_fallback: dict | None = None) -
     receipt_line = format_receipt_line(movement)
     if receipt_line:
         lines.append(receipt_line)
+    imputation_line = format_imputation_line(movement)
+    if imputation_line:
+        lines.append(imputation_line)
     if movement.get("needs_counterparty"):
         lines.append(f"⚠ Completá el {_counterparty_label(kind)} desde la app")
     return "\n".join(lines)
@@ -733,6 +776,7 @@ def _resolve_pending_choice(phone: str, body: str) -> str | None:
     pending_resp = list_pending(phone)
     pending = pending_resp.get("pending")
     pending_transfer = pending_resp.get("pendingTransfer") or pending_resp.get("pending_transfer")
+    pending_comprobante = pending_resp.get("pendingComprobante") or pending_resp.get("pending_comprobante")
 
     if pending:
         candidates = pending.get("candidates") or []
@@ -764,7 +808,29 @@ def _resolve_pending_choice(phone: str, body: str) -> str | None:
         log_receipt(result)
         if result.get("duplicated"):
             return format_duplicate_reply(result)
+        comprobante_menu = format_comprobante_match_menu(result.get("comprobanteMatch"))
+        if comprobante_menu:
+            return f"{format_movement_reply(result)}\n\n{comprobante_menu}"
         return format_movement_reply(result)
+
+    if pending_comprobante:
+        options = pending_comprobante.get("options") or []
+        skip_idx = min(len(options), 5) + 1
+        if 1 <= choice_num <= min(len(options), 5):
+            result = confirm_comprobante_pending(
+                phone,
+                pending_comprobante["id"],
+                {"kind": "select", "optionIndex": choice_num},
+            )
+            return format_movement_reply(result)
+        if choice_num == skip_idx:
+            confirm_comprobante_pending(
+                phone,
+                pending_comprobante["id"],
+                {"kind": "skip"},
+            )
+            return "Listo, no lo imputo ahora."
+        return "Opción inválida. Respondé con un número del menú o /cancelar."
 
     if pending_transfer:
         return _resolve_transfer_pending(phone, choice_num, pending_transfer)
@@ -863,6 +929,12 @@ def process_message(phone: str, body: str, sid: str, media_bytes: bytes | None, 
         dup_reply = format_duplicate_reply(result)
         add_to_history(phone, "bot", dup_reply)
         return dup_reply
+
+    comprobante_menu = format_comprobante_match_menu(result.get("comprobanteMatch"))
+    if comprobante_menu:
+        reply = f"{format_movement_reply(result, parsed)}\n\n{comprobante_menu}"
+        add_to_history(phone, "bot", reply)
+        return reply
 
     reply = format_movement_reply(result, parsed)
     add_to_history(phone, "bot", reply)
