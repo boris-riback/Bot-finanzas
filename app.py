@@ -721,17 +721,34 @@ def format_candidate_menu(candidates: list, suggested_name: str, suggested_cbu: 
     lines.append(f"{idx['varios']}. {varios_label}")
     if idx["create"]:
         lines.append(f"{idx['create']}. Crear nuevo: {suggested_name}")
-    lines.append(f"{idx['skip']}. Dejar en blanco (completar después)")
+    lines.append(f"{idx['skip']}. Dejar en blanco (podés sumar nota: {idx['skip']} nota: ...)")
     lines.append(f"{idx['cancel']}. Cancelar")
     return "\n".join(lines)
 
 
 NUMERIC_REPLY = re.compile(r"^\s*(\d+)\s*$")
+SELECTION_REPLY = re.compile(r"^\s*(\d+)(?:[\s\.\)\]:;\-]+(?P<note>.*))?\s*$", re.DOTALL)
+NOTE_PREFIX_RE = re.compile(r"^(?:nota|notas|obs|observacion|observación|comentario)\s*[:=\-]?\s*", re.IGNORECASE)
 
 
 def try_parse_numeric(body: str) -> int | None:
     m = NUMERIC_REPLY.match(body or "")
     return int(m.group(1)) if m else None
+
+
+def parse_pending_selection_reply(body: str) -> tuple[int, str] | None:
+    m = SELECTION_REPLY.match(body or "")
+    if not m:
+        return None
+    note = (m.group("note") or "").strip()
+    note = NOTE_PREFIX_RE.sub("", note).strip()
+    return int(m.group(1)), note
+
+
+def with_optional_note(choice: dict, note: str) -> dict:
+    if not note:
+        return choice
+    return {**choice, "notes": note}
 
 
 def _resolve_transfer_pending(phone: str, choice_num: int, pending_transfer: dict) -> str:
@@ -769,9 +786,10 @@ def _resolve_pending_choice(phone: str, body: str) -> str | None:
             return "Selección cancelada."
         return None
 
-    choice_num = try_parse_numeric(body)
-    if choice_num is None:
+    selection = parse_pending_selection_reply(body)
+    if selection is None:
         return None
+    choice_num, choice_note = selection
 
     pending_resp = list_pending(phone)
     pending = pending_resp.get("pending")
@@ -788,15 +806,15 @@ def _resolve_pending_choice(phone: str, body: str) -> str | None:
             cp = visible[choice_num - 1]
             result = confirm_pending(
                 phone,
-                {"kind": "existing", "counterpartyId": cp["id"]},
+                with_optional_note({"kind": "existing", "counterpartyId": cp["id"]}, choice_note),
                 pending_id=pending["id"],
             )
         elif choice_num == idx["varios"]:
-            result = confirm_pending(phone, {"kind": "varios"}, pending_id=pending["id"])
+            result = confirm_pending(phone, with_optional_note({"kind": "varios"}, choice_note), pending_id=pending["id"])
         elif idx["create"] and choice_num == idx["create"]:
-            result = confirm_pending(phone, {"kind": "new", "name": raw_name}, pending_id=pending["id"])
+            result = confirm_pending(phone, with_optional_note({"kind": "new", "name": raw_name}, choice_note), pending_id=pending["id"])
         elif choice_num == idx["skip"]:
-            result = confirm_pending(phone, {"kind": "skip"}, pending_id=pending["id"])
+            result = confirm_pending(phone, with_optional_note({"kind": "skip"}, choice_note), pending_id=pending["id"])
         elif choice_num == idx["cancel"]:
             result = confirm_pending(phone, {"kind": "cancel"}, pending_id=pending["id"])
             if result.get("cancelled"):

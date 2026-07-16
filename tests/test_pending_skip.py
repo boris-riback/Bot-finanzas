@@ -75,6 +75,27 @@ def test_skip_choice_ingreso_uses_cliente(monkeypatch):
     assert "Completá el cliente desde la app" in reply
 
 
+def test_skip_choice_accepts_note_after_number(monkeypatch):
+    _install_pending(monkeypatch)
+    fake_result = {
+        "kind": "egreso",
+        "amount": 5000,
+        "movement_date": "2026-04-22",
+        "needs_counterparty": True,
+        "counterparty_name": None,
+        "notes": "sin proveedor claro",
+    }
+    fake = _FakeConfirm(fake_result)
+    monkeypatch.setattr(app, "confirm_pending", fake)
+
+    reply = _resolve_pending_choice("+5490", "5 nota: sin proveedor claro")
+
+    assert len(fake.calls) == 1
+    assert fake.calls[0]["choice"] == {"kind": "skip", "notes": "sin proveedor claro"}
+    assert fake.calls[0]["pending_id"] == "pending-1"
+    assert "sin proveedor claro" in reply
+
+
 def test_cancel_still_works(monkeypatch):
     _install_pending(monkeypatch)
     fake = _FakeConfirm({"cancelled": True})
@@ -106,6 +127,27 @@ def test_existing_candidate_by_number(monkeypatch):
     reply = _resolve_pending_choice("+5490", "1")
     assert fake.calls[0]["choice"] == {"kind": "existing", "counterpartyId": "a"}
     assert "Proveedor A" in reply
+
+
+def test_existing_choice_accepts_note_after_number(monkeypatch):
+    _install_pending(monkeypatch)
+    fake_result = {
+        "kind": "egreso",
+        "amount": 3000,
+        "counterparty_name": "Proveedor A",
+        "notes": "corresponde a mayo",
+    }
+    fake = _FakeConfirm(fake_result)
+    monkeypatch.setattr(app, "confirm_pending", fake)
+
+    reply = _resolve_pending_choice("+5490", "1 obs: corresponde a mayo")
+
+    assert fake.calls[0]["choice"] == {
+        "kind": "existing",
+        "counterpartyId": "a",
+        "notes": "corresponde a mayo",
+    }
+    assert "corresponde a mayo" in reply
 
 
 def test_skip_without_raw_name_is_index_4(monkeypatch):
