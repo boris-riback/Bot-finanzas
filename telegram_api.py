@@ -178,6 +178,38 @@ def split_message(text: str) -> list[str]:
     return chunks
 
 
+def send_document(chat_id: str, url: str, filename: str, caption: str = "") -> bool:
+    """Descarga el archivo y lo sube a Telegram como documento.
+
+    Se sube el contenido en vez de pasarle la URL a Telegram para controlar el
+    nombre del archivo: pasando la URL firmada, Telegram lo nombra a partir del
+    path y se pierde el nombre con la contraparte.
+    """
+    try:
+        r = httpx.get(url, timeout=TIMEOUT, follow_redirects=True)
+        r.raise_for_status()
+    except httpx.HTTPError:
+        log.exception("no se pudo descargar el documento %s", filename)
+        return False
+
+    try:
+        resp = httpx.post(
+            f"{API_BASE}/sendDocument",
+            data={"chat_id": chat_id, "caption": caption[:1024]} if caption else {"chat_id": chat_id},
+            files={"document": (filename, r.content, "application/pdf")},
+            timeout=TIMEOUT,
+        )
+    except httpx.HTTPError:
+        log.exception("no se pudo enviar el documento a %s", chat_id)
+        return False
+
+    if resp.status_code != 200:
+        log.error("sendDocument %s: %s", resp.status_code, resp.text[:300])
+        return False
+    log.info("documento enviado a %s (%s, %d bytes)", chat_id, filename, len(r.content))
+    return True
+
+
 def set_my_commands(commands: list[tuple[str, str]]) -> bool:
     """Publica el menú de comandos que Telegram autocompleta al escribir "/".
 

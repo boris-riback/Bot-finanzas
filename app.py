@@ -179,11 +179,16 @@ def build_prompt_text(catalog: dict, body: str, has_attachment: bool, phone: str
         "Decidí primero el TIPO de operación:\n"
         "- \"egreso\" | \"ingreso\": pago/cobro real (plata entró o salió, o queda como pendiente contra una contraparte).\n"
         "- \"transferencia\": movimiento interno entre dos cajas/cuentas propias. Disparadores: \"transferí X de [caja1] a [caja2]\", \"moví/pasé X de [caja1] a [caja2]\", \"transferencia interna\". NO hay contraparte.\n"
+        "- \"recibo\": el usuario PIDE un recibo ya emitido, no carga nada. Disparadores: \"pasame el recibo de X\", \"mandame el último recibo de X\", \"quiero el recibo RP-000012\".\n"
+        "  Devolvé el texto de búsqueda en \"search\": el nombre de la contraparte o el número de recibo, sin palabras de relleno.\n"
+        "  \"pasame el ultimo recibo de mgb\" → search \"mgb\". \"mandame el RP-000012\" → search \"RP-000012\". Si no menciona ninguno, search vacío.\n"
         "- \"anular\": el usuario pide DESHACER lo último que cargó. Disparadores: \"borrá/eliminá/anulá el último movimiento\", \"deshacé lo último\", \"cancelá lo que cargué recién\", \"me equivoqué, sacá eso\".\n"
         "  Sólo aplica si NO hay datos de un movimiento nuevo en el mensaje. Si el usuario dice \"borrá el último y cargá X\", priorizá cargar X.\n"
         "  Si tenés dudas entre anular y cargar, elegí cargar: anular se confirma después y cargar de más es más facil de revertir que anular de más.\n\n"
         "Si es anular, devolvé JSON:\n"
         "{ \"kind\": \"anular\" }\n\n"
+        "Si es recibo, devolvé JSON:\n"
+        "{ \"kind\": \"recibo\", \"search\": \"<contraparte o numero, vacio si no menciona>\" }\n\n"
         "Si es transferencia, devolvé JSON:\n"
         "{\n"
         '  "kind": "transferencia",\n'
@@ -616,6 +621,50 @@ def handle_liquidar(phone: str, sid: str, body: str) -> str:
         mapped = _map_rrhh_error(code, msg, name)
         return mapped or ""
     return result.get("message") or "Liquidación preparada. Respondé SI para confirmar o NO para cancelar."
+
+
+def build_receipt_document(phone: str, receipt_id: str | None = None,
+                           movement_id: str | None = None, search: str | None = None) -> dict | None:
+    """Pide el PDF al backend y arma la respuesta-documento. None si no se pudo.
+
+    Nunca levanta: que falle el PDF no debe tumbar la respuesta del movimiento.
+    """
+    try:
+        result = receipt_pdf(phone, receipt_id=receipt_id, movement_id=movement_id, search=search)
+    except httpx.HTTPError:
+        log.exception("no se pudo obtener el PDF del recibo")
+        return None
+    url = result.get("pdfUrl")
+    if not url:
+        return None
+    receipt = result.get("receipt") or {}
+    return {
+        "document": url,
+        "filename": result.get("fileName") or f"{receipt.get('number', 'recibo')}.pdf",
+        "caption": f"Recibo {receipt.get('number', '')}".strip(),
+    }
+
+
+def handle_receipt_pdf_query(phone: str, search: str = "") -> list:
+    """Manda el PDF del recibo que matchee. Si no matchea, lo dice en texto."""
+    try:
+        result = receipt_pdf(phone, search=search or None)
+    except httpx.HTTPStatusError as e:
+        detail, _ = _extract_edge_error(e)
+        return [detail or "No pude encontrar ese recibo."]
+    except httpx.HTTPError:
+        log.exception("error pidiendo el PDF del recibo")
+        return ["No pude generar el recibo. Probá de nuevo en un momento."]
+
+    receipt = result.get("receipt") or {}
+    document = {
+        "document": result.get("pdfUrl"),
+        "filename": result.get("fileName") or "recibo.pdf",
+        "caption": f"Recibo {receipt.get('number', '')}".strip(),
+    }
+    if not document["document"]:
+        return ["Encontré el recibo pero no pude generar el PDF."]
+    return [document]
 
 
 def handle_receipts_query(phone: str, argument: str = "") -> str:
@@ -1244,6 +1293,10 @@ def process_message(phone: str, body: str, sid: str, media_bytes: bytes | None, 
         add_to_history(phone, "bot", error_reply)
         return error_reply
 
+    if parsed.get("kind") == "recibo":
+        log.info("routing to receipt_pdf | search=%r", parsed.get("search"))
+        return handle_receipt_pdf_query(phone, (parsed.get("search") or "").strip())
+
     if parsed.get("kind") == "anular":
         log.info("routing to request_cancel_movement")
         reply = handle_cancel_request(phone)
@@ -1308,11 +1361,34 @@ def process_message(phone: str, body: str, sid: str, media_bytes: bytes | None, 
     if comprobante_menu:
         reply = f"{format_movement_reply(result, parsed)}\n\n{comprobante_menu}"
         add_to_history(phone, "bot", reply)
+        # Con menú abierto no se manda el PDF: primero que resuelva la imputación.
         return reply
 
     reply = format_movement_reply(result, parsed)
     add_to_history(phone, "bot", reply)
+
+    # Si el movimiento generó recibo, se manda también el PDF. Va después del
+    # texto para que el resumen se lea aunque el archivo tarde o falle.
+    if extract_receipt_info(result):
+        document = build_receipt_document(phone, movement_id=result.get("id"))
+        if document:
+            return [reply, document]
     return reply
+
+
+def _flatten_replies(items: list) -> list:
+    """Aplana los retornos de process_message.
+
+    Devuelve un str cuando sólo hay texto, o [texto, documento] cuando además hay
+    un PDF que mandar. Acá se normaliza a una lista plana de respuestas.
+    """
+    out = []
+    for item in items:
+        if isinstance(item, list):
+            out.extend(item)
+        elif item:
+            out.append(item)
+    return out
 
 
 def handle_incoming(phone: str, body: str, sid: str, media_items: list[dict]) -> list[str]:
@@ -1375,7 +1451,7 @@ def handle_incoming(phone: str, body: str, sid: str, media_items: list[dict]) ->
         return ["Mensaje vacío. Escribí /ayuda."]
 
     if not doc_items:
-        replies = [process_message(phone, body, sid, None, None)]
+        replies = _flatten_replies([process_message(phone, body, sid, None, None)])
     else:
         # Cada adjunto es un comprobante distinto → un movimiento por adjunto.
         # El texto acompaña sólo al primero para no duplicar monto/nota en todos.
@@ -1390,6 +1466,7 @@ def handle_incoming(phone: str, body: str, sid: str, media_items: list[dict]) ->
             )
             for i, item in enumerate(doc_items)
         ]
+        replies = _flatten_replies(replies)
 
     if reminder:
         replies.append(reminder)
@@ -1447,7 +1524,13 @@ def process_async(channel, phone: str, body: str, sid: str, media_refs: list[dic
     for reply in replies:
         if not reply:
             continue
-        channel.send_message(phone, reply)
+        # Una respuesta puede ser texto o un documento: {"document", "filename", "caption"}.
+        if isinstance(reply, dict) and reply.get("document"):
+            channel.send_document(
+                phone, reply["document"], reply.get("filename") or "recibo.pdf", reply.get("caption") or "",
+            )
+        else:
+            channel.send_message(phone, reply)
         sent += 1
     log.info("async reply sent to %s (%d mensajes)", phone, sent)
 

@@ -142,6 +142,23 @@ def confirm_transfer_pending(phone: str, pending_id: str, choice: dict) -> dict:
     })
 
 
+def receipt_pdf(phone: str, receipt_id: str | None = None, movement_id: str | None = None,
+                search: str | None = None) -> dict:
+    """Devuelve {receipt, pdfUrl, fileName} del recibo pedido.
+
+    El backend genera el PDF la primera vez y lo archiva en Storage; de ahí en
+    más sirve el ya guardado. La URL viene firmada y dura 30 minutos.
+    """
+    payload = {"action": "receipt_pdf", "phone": phone}
+    if receipt_id:
+        payload["receiptId"] = receipt_id
+    if movement_id:
+        payload["movementId"] = movement_id
+    if search:
+        payload["search"] = search
+    return _post(payload)
+
+
 def list_receipts(phone: str, search: str | None = None, limit: int | None = None) -> dict:
     """Recibos emitidos, del más nuevo al más viejo.
 

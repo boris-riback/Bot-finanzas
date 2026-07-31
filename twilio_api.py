@@ -149,6 +149,29 @@ def download_media(refs: list[dict]) -> list[dict]:
     return items
 
 
+def send_document(to: str, url: str, filename: str, caption: str = "") -> bool:
+    """Manda el PDF como adjunto de WhatsApp.
+
+    A diferencia de Telegram, acá se le pasa la URL a Twilio y es Twilio quien la
+    descarga, así que la URL tiene que seguir viva cuando llega el mensaje. El
+    nombre del archivo lo decide WhatsApp a partir de la URL: no es controlable.
+    """
+    if not enabled():
+        log.error("canal Twilio apagado: no se pudo enviar %s a %s", filename, to)
+        return False
+    try:
+        _client.messages.create(
+            from_=f"whatsapp:{WHATSAPP_NUMBER}",
+            to=f"whatsapp:{to}",
+            body=caption or "",
+            media_url=[url],
+        )
+    except Exception:
+        log.exception("no se pudo enviar el documento a %s", to)
+        return False
+    return True
+
+
 def send_message(to: str, text: str) -> None:
     """Envía una respuesta por la API REST. No lanza: un fallo no debe cortar el batch."""
     if not enabled():
