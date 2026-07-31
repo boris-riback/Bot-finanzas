@@ -16,6 +16,7 @@ from openai import OpenAI
 import telegram_api
 import twilio_api
 from bialystok_client import (
+    confirm_cancel_movement,
     confirm_comprobante_pending,
     confirm_pending,
     confirm_transfer_pending,
@@ -24,6 +25,7 @@ from bialystok_client import (
     ingest,
     internal_transfer,
     list_pending,
+    request_cancel_movement,
     rrhh_advance,
     rrhh_confirm_liquidation,
     rrhh_liquidate,
@@ -175,7 +177,12 @@ def build_prompt_text(catalog: dict, body: str, has_attachment: bool, phone: str
         f'Mensaje del usuario: "{body}"\n\n'
         "Decidí primero el TIPO de operación:\n"
         "- \"egreso\" | \"ingreso\": pago/cobro real (plata entró o salió, o queda como pendiente contra una contraparte).\n"
-        "- \"transferencia\": movimiento interno entre dos cajas/cuentas propias. Disparadores: \"transferí X de [caja1] a [caja2]\", \"moví/pasé X de [caja1] a [caja2]\", \"transferencia interna\". NO hay contraparte.\n\n"
+        "- \"transferencia\": movimiento interno entre dos cajas/cuentas propias. Disparadores: \"transferí X de [caja1] a [caja2]\", \"moví/pasé X de [caja1] a [caja2]\", \"transferencia interna\". NO hay contraparte.\n"
+        "- \"anular\": el usuario pide DESHACER lo último que cargó. Disparadores: \"borrá/eliminá/anulá el último movimiento\", \"deshacé lo último\", \"cancelá lo que cargué recién\", \"me equivoqué, sacá eso\".\n"
+        "  Sólo aplica si NO hay datos de un movimiento nuevo en el mensaje. Si el usuario dice \"borrá el último y cargá X\", priorizá cargar X.\n"
+        "  Si tenés dudas entre anular y cargar, elegí cargar: anular se confirma después y cargar de más es más facil de revertir que anular de más.\n\n"
+        "Si es anular, devolvé JSON:\n"
+        "{ \"kind\": \"anular\" }\n\n"
         "Si es transferencia, devolvé JSON:\n"
         "{\n"
         '  "kind": "transferencia",\n'
@@ -609,6 +616,59 @@ def handle_liquidar(phone: str, sid: str, body: str) -> str:
     return result.get("message") or "Liquidación preparada. Respondé SI para confirmar o NO para cancelar."
 
 
+CANCEL_PENDING_REMINDER = (
+    "⚠️ Seguís con una anulación esperando confirmación. "
+    "Respondé SI para anular o NO para dejarlo como está."
+)
+
+
+def handle_cancel_request(phone: str) -> str:
+    """Pide el último movimiento del bot y deja la anulación esperando el SI.
+
+    No anula nada acá: el backend registra el pendiente y devuelve el resumen.
+    """
+    try:
+        result = request_cancel_movement(phone)
+    except httpx.HTTPStatusError as e:
+        # La edge function responde {"error": "<texto para el usuario>"}, así que
+        # el mensaje viaja en el primer elemento de la tupla, no en el segundo.
+        detail, _ = _extract_edge_error(e)
+        # 404 (no hay nada) y 409 (bloqueado por origen) ya vienen redactados
+        # para el usuario final, así que se muestran tal cual.
+        if e.response.status_code in (404, 409) and detail:
+            return detail
+        raise
+    return (
+        f"Vas a anular:\n{result.get('summary', '')}\n\n"
+        "El movimiento queda anulado (no se borra) y sale de los saldos.\n"
+        "Respondé SI para confirmar o NO para dejarlo como está."
+    )
+
+
+def handle_cancel_confirmation(phone: str, body: str, pending_cancellation: dict) -> str | None:
+    """Resuelve SI/NO contra una anulación pendiente ya leída del backend.
+
+    Devuelve el texto de respuesta si consumió el mensaje, o None si el mensaje no
+    era una confirmación. En ese caso la anulación queda viva hasta que el usuario
+    la resuelva o expire sola a los 30 minutos.
+    """
+    lower = (body or "").strip().lower()
+    if lower in LIQ_CONFIRM_WORDS:
+        confirm = True
+    elif lower in LIQ_CANCEL_WORDS:
+        confirm = False
+    else:
+        return None
+    try:
+        result = confirm_cancel_movement(phone, pending_cancellation["id"], confirm)
+    except httpx.HTTPStatusError as e:
+        detail, _ = _extract_edge_error(e)
+        return detail or "No pude completar la anulación. Probá de nuevo."
+    if not confirm:
+        return "Listo, no anulé nada."
+    return f"✅ Movimiento anulado:\n{result.get('summary', '')}"
+
+
 def handle_liquidation_confirmation(phone: str, body: str, pending_liquidation: dict) -> str | None:
     """Resuelve SI/NO contra una liquidación pendiente ya leída del backend.
 
@@ -959,6 +1019,7 @@ def _cancel_pending_state(phone: str, pending_resp: dict) -> str:
     pending = pending_resp.get("pending")
     pending_transfer = pending_resp.get("pendingTransfer") or pending_resp.get("pending_transfer")
     pending_liquidation = pending_resp.get("pendingLiquidation")
+    pending_cancellation = pending_resp.get("pendingCancellation")
     cancelled = []
 
     if pending:
@@ -979,6 +1040,12 @@ def _cancel_pending_state(phone: str, pending_resp: dict) -> str:
                 cancelled.append("la liquidación")
         except httpx.HTTPStatusError:
             log.exception("no se pudo cancelar la liquidación pendiente")
+    if pending_cancellation:
+        try:
+            if confirm_cancel_movement(phone, pending_cancellation["id"], False).get("cancelled"):
+                cancelled.append("la anulación")
+        except httpx.HTTPStatusError:
+            log.exception("no se pudo descartar la anulación pendiente")
 
     if not cancelled:
         return "No hay nada pendiente para cancelar."
@@ -1106,6 +1173,12 @@ def process_message(phone: str, body: str, sid: str, media_bytes: bytes | None, 
         add_to_history(phone, "bot", error_reply)
         return error_reply
 
+    if parsed.get("kind") == "anular":
+        log.info("routing to request_cancel_movement")
+        reply = handle_cancel_request(phone)
+        add_to_history(phone, "bot", reply)
+        return reply
+
     if parsed.get("kind") == "transferencia":
         log.info("routing to internal_transfer")
         result = internal_transfer(
@@ -1203,6 +1276,16 @@ def handle_incoming(phone: str, body: str, sid: str, media_items: list[dict]) ->
             return [f"No conozco el comando {command}.\n\n{HELP_INDEX}"]
 
         state = fetch_pending_state(phone)
+
+        # La anulación se resuelve antes que nada: si hay una esperando, un "si"
+        # tiene que anular y no caer al parser como si fuera un movimiento nuevo.
+        pending_cancellation = state.get("pendingCancellation")
+        if pending_cancellation:
+            cancel_reply = handle_cancel_confirmation(phone, body, pending_cancellation)
+            if cancel_reply is not None:
+                return [cancel_reply]
+            reminder = CANCEL_PENDING_REMINDER
+
         pending_liquidation = state.get("pendingLiquidation")
         if pending_liquidation:
             liq_reply = handle_liquidation_confirmation(phone, body, pending_liquidation)

@@ -140,3 +140,22 @@ def confirm_transfer_pending(phone: str, pending_id: str, choice: dict) -> dict:
         "pendingId": pending_id,
         "choice": choice,
     })
+
+
+def request_cancel_movement(phone: str) -> dict:
+    """Pide anular el último movimiento cargado por el bot.
+
+    No anula nada: deja el pendiente esperando el SI y devuelve el resumen de lo
+    que se anularía. El backend marca status='anulado' —el ERP nunca borra
+    movimientos— y desimputa los comprobantes antes de hacerlo.
+    """
+    return _post({"action": "request_cancel_movement", "phone": phone})
+
+
+def confirm_cancel_movement(phone: str, pending_id: str, confirm: bool) -> dict:
+    return _post({
+        "action": "confirm_cancel_movement",
+        "phone": phone,
+        "pendingId": pending_id,
+        "confirm": confirm,
+    })
