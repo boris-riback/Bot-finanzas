@@ -25,6 +25,7 @@ from bialystok_client import (
     ingest,
     internal_transfer,
     list_pending,
+    list_receipts,
     request_cancel_movement,
     rrhh_advance,
     rrhh_confirm_liquidation,
@@ -493,6 +494,7 @@ HELP_ALIASES = {
 BOT_COMMANDS = [
     ("/ayuda", "Qué sé hacer (/ayuda <tema> para el detalle)"),
     ("/resumen", "Pagos pendientes: vencidos, 7 y 30 días"),
+    ("/recibos", "Recibos emitidos: /recibos <numero o proveedor>"),
     ("/adelanto", "Adelanto a empleado: /adelanto <nombre> <monto>"),
     ("/liquidar", "Liquidación semanal: /liquidar <nombre completo>"),
     ("/cancelar", "Cancela lo que haya pendiente"),
@@ -614,6 +616,25 @@ def handle_liquidar(phone: str, sid: str, body: str) -> str:
         mapped = _map_rrhh_error(code, msg, name)
         return mapped or ""
     return result.get("message") or "Liquidación preparada. Respondé SI para confirmar o NO para cancelar."
+
+
+def handle_receipts_query(phone: str, argument: str = "") -> str:
+    """Responde /recibos [texto]. Sin argumento devuelve los últimos emitidos."""
+    search = (argument or "").strip()
+    try:
+        result = list_receipts(phone, search=search or None)
+    except httpx.HTTPStatusError as e:
+        detail, _ = _extract_edge_error(e)
+        return detail or "No pude leer los recibos. Probá de nuevo en un momento."
+
+    receipts = result.get("receipts") or []
+    if not receipts:
+        if search:
+            return f"No encontré recibos que matcheen \"{search}\"."
+        return "Todavía no hay recibos emitidos."
+
+    header = f"Recibos que matchean \"{search}\":" if search else "Últimos recibos emitidos:"
+    return header + "\n\n" + "\n\n".join(format_receipt_block(r) for r in receipts)
 
 
 CANCEL_PENDING_REMINDER = (
@@ -755,17 +776,67 @@ def extract_receipt_info(result: dict | None) -> dict | None:
         return {
             "id": receipt.get("id"),
             "number": receipt.get("number"),
+            # El backend todavia no genera PDF (payment_receipts.pdf_path esta
+            # vacio en todas las filas): queda listo para cuando exista.
             "url": receipt.get("url") or receipt.get("pdfUrl"),
+            "receiptKind": receipt.get("receiptKind"),
+            "receiptDate": receipt.get("receiptDate"),
+            "amount": receipt.get("amount"),
+            "counterpartyName": receipt.get("counterpartyName"),
+            "paymentMethod": receipt.get("paymentMethod"),
         }
     if result.get("receiptGenerated"):
         return {"id": None, "number": None, "url": None}
     return None
 
 
+RECEIPT_KIND_LABELS = {"payment": "RECIBO DE PAGO", "income": "RECIBO DE COBRO"}
+
+
+def format_receipt_block(receipt: dict) -> str:
+    """Recibo formateado para el chat, a partir de una fila de payment_receipts.
+
+    Texto plano a propósito: send_message no manda parse_mode, así que cualquier
+    marca de formato se vería con los asteriscos literales.
+    """
+    number = receipt.get("number") or ""
+    kind = receipt.get("receipt_kind") or receipt.get("receiptKind") or "payment"
+    label = RECEIPT_KIND_LABELS.get(kind, "RECIBO")
+    lines = [f"🧾 {label} {number}".strip()]
+
+    date = receipt.get("receipt_date") or receipt.get("receiptDate")
+    counterparty = receipt.get("counterparty_name") or receipt.get("counterpartyName")
+    amount = receipt.get("amount")
+    method = receipt.get("payment_method") or receipt.get("paymentMethod")
+
+    if date:
+        lines.append(f"Fecha:        {format_receipt_date(date)}")
+    if counterparty:
+        lines.append(f"Contraparte:  {counterparty}")
+    if amount is not None:
+        lines.append(f"Monto:        {format_amount(amount)}")
+    if method:
+        lines.append(f"Método:       {method}")
+    return "\n".join(lines)
+
+
+def format_receipt_date(value) -> str:
+    """YYYY-MM-DD -> DD/MM/YYYY. Si no matchea, se devuelve tal cual."""
+    text = str(value or "")
+    parts = text.split("-")
+    if len(parts) == 3 and len(parts[0]) == 4:
+        return f"{parts[2][:2]}/{parts[1]}/{parts[0]}"
+    return text
+
+
 def format_receipt_line(result: dict | None) -> str:
     info = extract_receipt_info(result)
     if not info:
         return ""
+    # Con los datos completos se muestra el recibo entero; si el backend sólo
+    # mandó el flag, se cae al aviso de una línea de siempre.
+    if info.get("number") and info.get("amount") is not None:
+        return format_receipt_block(info)
     number = info.get("number")
     if number:
         return f"🧾 Comprobante #{number} generado"
@@ -1272,6 +1343,8 @@ def handle_incoming(phone: str, body: str, sid: str, media_items: list[dict]) ->
             return [handle_liquidar(phone, sid, body)]
         if command == "/resumen":
             return [handle_summary(phone)]
+        if command == "/recibos":
+            return [handle_receipts_query(phone, argument)]
         if command and command != "/cancelar":
             return [f"No conozco el comando {command}.\n\n{HELP_INDEX}"]
 

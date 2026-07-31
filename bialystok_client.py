@@ -142,6 +142,19 @@ def confirm_transfer_pending(phone: str, pending_id: str, choice: dict) -> dict:
     })
 
 
+def list_receipts(phone: str, search: str | None = None, limit: int | None = None) -> dict:
+    """Recibos emitidos, del más nuevo al más viejo.
+
+    `search` matchea número (RP-000012) o contraparte; sin search trae los últimos.
+    """
+    payload = {"action": "list_receipts", "phone": phone}
+    if search:
+        payload["search"] = search
+    if limit:
+        payload["limit"] = limit
+    return _post(payload)
+
+
 def request_cancel_movement(phone: str) -> dict:
     """Pide anular el último movimiento cargado por el bot.
 

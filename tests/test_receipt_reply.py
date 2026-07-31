@@ -44,7 +44,11 @@ def test_extract_receipt_flag_only():
 
 def test_extract_receipt_object():
     info = extract_receipt_info({"receipt": {"id": "r-1", "number": "123", "url": "https://x/r-1.pdf"}})
-    assert info == {"id": "r-1", "number": "123", "url": "https://x/r-1.pdf"}
+    # Subset y no igualdad: extract_receipt_info fue creciendo con los datos
+    # del recibo (fecha, monto, contraparte, metodo) para poder mostrarlo entero.
+    assert info["id"] == "r-1"
+    assert info["number"] == "123"
+    assert info["url"] == "https://x/r-1.pdf"
 
 
 def test_extract_receipt_pdf_url_alias():
@@ -111,7 +115,10 @@ def test_receipt_extra_fields_ignored_safely():
             "receiptKind": "payment", "movementId": "m1", "created": True,
         },
     })
-    assert info == {"id": "r1", "number": "RP-000001", "url": None}
+    assert info["id"] == "r1"
+    assert info["number"] == "RP-000001"
+    assert info["url"] is None
+    assert info["receiptKind"] == "payment"
 
 
 def test_receipt_generated_false_no_line():
