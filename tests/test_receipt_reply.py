@@ -3,6 +3,8 @@ import sys
 import pathlib
 
 os.environ.setdefault("ANTHROPIC_API_KEY", "test")
+os.environ.setdefault("TELEGRAM_BOT_TOKEN", "123:test")
+os.environ.setdefault("TELEGRAM_WEBHOOK_SECRET", "test-secret")
 os.environ.setdefault("TWILIO_ACCOUNT_SID", "AC_test")
 os.environ.setdefault("TWILIO_AUTH_TOKEN", "test")
 os.environ.setdefault("TWILIO_WHATSAPP_NUMBER", "+100000000")

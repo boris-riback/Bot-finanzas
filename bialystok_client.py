@@ -1,5 +1,6 @@
 import base64
 import os
+import threading
 import time
 
 import httpx
@@ -12,7 +13,12 @@ _HEADERS = {
     "Content-Type": "application/json",
 }
 
-_catalog_cache = {"data": None, "expires": 0}
+CATALOG_TTL_SECONDS = 3600
+
+# El catálogo depende de la organización que resuelve el teléfono en el edge,
+# así que se cachea por teléfono. Un slot único filtraría datos entre orgs.
+_catalog_cache: dict[str, dict] = {}
+_catalog_lock = threading.Lock()
 
 
 def _post(payload: dict) -> dict:
@@ -23,10 +29,13 @@ def _post(payload: dict) -> dict:
 
 def fetch_catalog(phone: str) -> dict:
     now = time.time()
-    if _catalog_cache["data"] and _catalog_cache["expires"] > now:
-        return _catalog_cache["data"]
+    with _catalog_lock:
+        entry = _catalog_cache.get(phone)
+        if entry and entry["expires"] > now:
+            return entry["data"]
     data = _post({"action": "catalog", "phone": phone})
-    _catalog_cache.update(data=data, expires=now + 3600)
+    with _catalog_lock:
+        _catalog_cache[phone] = {"data": data, "expires": now + CATALOG_TTL_SECONDS}
     return data
 
 

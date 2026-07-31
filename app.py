@@ -5,7 +5,6 @@ import logging
 import os
 import re
 import threading
-import time
 from collections import defaultdict, deque
 from datetime import datetime
 
@@ -13,9 +12,9 @@ import anthropic
 import httpx
 from flask import Flask, request
 from openai import OpenAI
-from twilio.rest import Client as TwilioClient
-from twilio.twiml.messaging_response import MessagingResponse
 
+import telegram_api
+import twilio_api
 from bialystok_client import (
     confirm_comprobante_pending,
     confirm_pending,
@@ -36,11 +35,20 @@ app = Flask(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("bot")
 
-TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID")
-TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN")
-TWILIO_WHATSAPP_NUMBER = os.environ.get("TWILIO_WHATSAPP_NUMBER")
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+# Los errores del backend se loguean siempre; esto sólo controla si además se
+# le muestran al usuario en el chat.
+EXPOSE_ERROR_DETAIL = _env_flag("EXPOSE_ERROR_DETAIL", False)
 
 IMAGE_MIMES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
 PDF_MIMES = {"application/pdf"}
@@ -81,7 +89,6 @@ AUDIO_MIME_EXT = {
 
 claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
-twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 
 MAX_HISTORY = 10
 conversation_history: dict[str, deque] = defaultdict(lambda: deque(maxlen=MAX_HISTORY))
@@ -283,48 +290,226 @@ def claude_parse(body: str, catalog: dict, media_bytes: bytes | None, media_mime
     return json.loads(text)
 
 
-COMMAND_RESPONSES = {
-    "/ayuda": (
-        "Comandos:\n"
-        "- /resumen: pagos pendientes próximos 7 y 30 días\n"
-        "- /adelanto <nombre> <monto> [nota]: registra adelanto a empleado\n"
-        "- /liquidar <nombre>: prepara liquidación semanal (pide SI/NO)\n"
-        "- /cancelar: cancela selección pendiente\n\n"
-        "Mandá texto libre con foto/PDF/audio para registrar movimiento. "
-        "Si aparecen opciones de proveedor, respondé con el número."
+# Ayuda por temas: el índice entra de un vistazo y el detalle se pide aparte.
+# Texto plano a propósito — send_message no manda parse_mode, así que cualquier
+# marca de Markdown se vería literal en el chat.
+HELP_INDEX = (
+    "🤖 Bot Finanzas — qué sé hacer\n"
+    "\n"
+    "Escribime en lenguaje natural. No hace falta formato.\n"
+    "Ej: \"MGB 5000 efectivo\" · \"ingreso 120000 alquiler chopera\"\n"
+    "\n"
+    "Temas (pedí el detalle con /ayuda <tema>):\n"
+    "  /ayuda cargar          registrar egresos e ingresos\n"
+    "  /ayuda adjuntos        fotos, PDF y audios\n"
+    "  /ayuda proveedores     cuando no reconozco a quién le pagaste\n"
+    "  /ayuda corregir        arreglar lo último que cargaste\n"
+    "  /ayuda transferencias  mover plata entre tus cajas\n"
+    "  /ayuda rrhh            adelantos y liquidaciones\n"
+    "  /ayuda consultas       qué le podés preguntar\n"
+    "  /ayuda comandos        lista seca de comandos\n"
+)
+
+HELP_TOPICS = {
+    "cargar": (
+        "💸 Registrar movimientos\n"
+        "\n"
+        "Escribí lo que pasó y yo armo el movimiento:\n"
+        "  MGB 5000 efectivo\n"
+        "  egreso 12000 a Coca por transferencia\n"
+        "  ingreso servicio del día 50000 nave\n"
+        "\n"
+        "Qué reconozco:\n"
+        "  • Monto y fecha. Si no decís fecha, va la de hoy.\n"
+        "  • Método de pago. Si no lo decís, asumo Efectivo.\n"
+        "  • Proveedor o cliente.\n"
+        "  • Unidad de negocio.\n"
+        "\n"
+        "Estado del pago:\n"
+        "  • Por defecto queda PAGADO.\n"
+        "  • Decí \"pendiente\", \"por pagar\" o \"a pagar\" para dejarlo pendiente.\n"
+        "\n"
+        "Notas: lo que escribas después de \"porque\", \"para\", \"nota:\" o entre\n"
+        "paréntesis va como observación.\n"
+        "  Ej: egreso 5000 a Coca por el evento de junio\n"
+        "\n"
+        "Fechas relativas como \"ayer\" o \"el martes\" también funcionan.\n"
+    ),
+    "adjuntos": (
+        "📎 Fotos, PDF y audios\n"
+        "\n"
+        "Mandá el comprobante y leo los datos solo: monto, fecha, proveedor,\n"
+        "CUIT, CBU, tipo y número de comprobante, método de pago.\n"
+        "\n"
+        "Podés mandarlo con texto o sin texto. Sin texto infiero todo del\n"
+        "documento, incluso si es egreso o ingreso.\n"
+        "\n"
+        "⚠️ Mandá los comprobantes como ARCHIVO, no como Foto.\n"
+        "Telegram comprime las fotos y un ticket con letra chica se vuelve\n"
+        "ilegible. Como archivo llega intacto.\n"
+        "\n"
+        "Varios comprobantes: mandalos de a uno o en álbum. Cada archivo genera\n"
+        "su propio movimiento.\n"
+        "\n"
+        "Cheques y eCheq: detecto la fecha de vencimiento aparte de la de\n"
+        "emisión. Si el cheque es a fecha futura queda como pendiente.\n"
+        "\n"
+        "Audios: los transcribo y los trato como si los hubieras escrito.\n"
+        "Sirve tanto para cargar un movimiento como para responder un menú.\n"
+    ),
+    "proveedores": (
+        "👤 Cuando no reconozco al proveedor\n"
+        "\n"
+        "Si el nombre no matchea con tu catálogo, te muestro un menú numerado.\n"
+        "Respondé con el número, nada más.\n"
+        "\n"
+        "Las opciones son:\n"
+        "  1..5  los proveedores parecidos que encontré\n"
+        "  •     Proveedor Varios — para gastos sueltos sin proveedor fijo\n"
+        "  •     Crear nuevo — lo doy de alta con el nombre que leí\n"
+        "  •     Dejar en blanco — se carga igual y lo completás en la app\n"
+        "  •     Cancelar — no registra nada\n"
+        "\n"
+        "En un ingreso el menú dice cliente en vez de proveedor.\n"
+        "\n"
+        "Si no querés elegir ninguna, /cancelar.\n"
+    ),
+    "corregir": (
+        "✏️ Corregir lo último\n"
+        "\n"
+        "Me acuerdo de los últimos mensajes de la conversación, así que podés\n"
+        "referirte a lo anterior sin repetir todo:\n"
+        "\n"
+        "  \"ya lo pagué\"          → lo pasa a pagado\n"
+        "  \"fue pagado\"           → igual\n"
+        "  \"cambiale el proveedor a Coca\"\n"
+        "  \"era para el otro proveedor\"\n"
+        "  \"ese era de ayer\"\n"
+        "\n"
+        "Funciona con \"ese\", \"el último\", \"el de recién\".\n"
+        "\n"
+        "Ojo: hoy la corrección genera un movimiento corregido, no edita el\n"
+        "original. Si ves algo duplicado, revisalo desde la app.\n"
+    ),
+    "transferencias": (
+        "🔄 Transferencias internas\n"
+        "\n"
+        "Plata que se mueve entre TUS cajas o cuentas. No hay proveedor.\n"
+        "\n"
+        "  transferí 50000 de Caja Chica a Galicia\n"
+        "  moví 20000 de Efectivo a Mercado Pago\n"
+        "  pasé 100000 de Galicia a Caja Chica\n"
+        "\n"
+        "Si no reconozco alguna de las dos cajas te muestro un menú numerado,\n"
+        "igual que con los proveedores.\n"
+    ),
+    "rrhh": (
+        "👷 Adelantos y liquidaciones\n"
+        "\n"
+        "/adelanto <nombre> <monto> [nota]\n"
+        "  Ej: /adelanto Juan Pérez 50000 para el alquiler\n"
+        "  Registra el adelanto y lo descuenta en la próxima liquidación.\n"
+        "\n"
+        "/liquidar <nombre completo>\n"
+        "  Ej: /liquidar Juan Pérez\n"
+        "  Calcula la liquidación semanal y te muestra el detalle:\n"
+        "  sueldo base, horas extra, adelantos aplicados y neto.\n"
+        "  NO se confirma sola — respondé SI para confirmarla o NO para\n"
+        "  descartarla.\n"
+        "\n"
+        "Sólo empleados en modalidad semanal.\n"
+        "\n"
+        "Si mandás otra cosa mientras hay una liquidación esperando, la\n"
+        "liquidación NO se pierde: te la recuerdo hasta que la resuelvas.\n"
+    ),
+    "consultas": (
+        "🔎 Consultas\n"
+        "\n"
+        "/resumen\n"
+        "  Pagos pendientes: vencidos, próximos 7 días y próximos 30 días,\n"
+        "  con total y proveedor de cada uno.\n"
+        "\n"
+        "Por ahora es la única consulta disponible. Preguntas del tipo\n"
+        "\"cuánto gasté en insumos\" o \"cuánto le debo a X\" todavía no las\n"
+        "puedo contestar — se consultan desde la app.\n"
+    ),
+    "comandos": (
+        "⌨️ Comandos\n"
+        "\n"
+        "/ayuda [tema]   esta ayuda\n"
+        "/resumen        pagos pendientes a 7 y 30 días\n"
+        "/adelanto       /adelanto <nombre> <monto> [nota]\n"
+        "/liquidar       /liquidar <nombre completo>\n"
+        "/cancelar       cancela lo que haya pendiente\n"
+        "\n"
+        "Respuestas cortas que entiendo en contexto:\n"
+        "  un número   elige una opción del menú\n"
+        "  SI / NO     confirma o descarta una liquidación\n"
+        "\n"
+        "Todo lo demás es texto libre: escribí el movimiento como te salga.\n"
     ),
 }
 
-# Commands that need dynamic handling (not static responses)
-DYNAMIC_COMMANDS = {"/resumen"}
+HELP_ALIASES = {
+    "carga": "cargar",
+    "movimientos": "cargar",
+    "adjunto": "adjuntos",
+    "fotos": "adjuntos",
+    "audio": "adjuntos",
+    "audios": "adjuntos",
+    "comprobantes": "adjuntos",
+    "proveedor": "proveedores",
+    "clientes": "proveedores",
+    "contrapartes": "proveedores",
+    "menu": "proveedores",
+    "menú": "proveedores",
+    "correccion": "corregir",
+    "corrección": "corregir",
+    "corregirlo": "corregir",
+    "editar": "corregir",
+    "transferencia": "transferencias",
+    "cajas": "transferencias",
+    "sueldos": "rrhh",
+    "liquidacion": "rrhh",
+    "liquidación": "rrhh",
+    "liquidaciones": "rrhh",
+    "adelantos": "rrhh",
+    "empleados": "rrhh",
+    "consulta": "consultas",
+    "reportes": "consultas",
+    "comando": "comandos",
+}
 
 
-PENDING_LIQUIDATION_TTL = 1800
-pending_liquidations: dict[str, dict] = {}
+# Menú que Telegram autocompleta al escribir "/". Se publica al arrancar,
+# así que agregar un comando acá alcanza para que aparezca en el chat.
+BOT_COMMANDS = [
+    ("/ayuda", "Qué sé hacer (/ayuda <tema> para el detalle)"),
+    ("/resumen", "Pagos pendientes: vencidos, 7 y 30 días"),
+    ("/adelanto", "Adelanto a empleado: /adelanto <nombre> <monto>"),
+    ("/liquidar", "Liquidación semanal: /liquidar <nombre completo>"),
+    ("/cancelar", "Cancela lo que haya pendiente"),
+]
+
+
+def build_help(argument: str = "") -> str:
+    topic = (argument or "").strip().lower().lstrip("/")
+    if not topic:
+        return HELP_INDEX
+    topic = HELP_ALIASES.get(topic, topic)
+    if topic in HELP_TOPICS:
+        return HELP_TOPICS[topic]
+    return (
+        f"No tengo un tema de ayuda para \"{argument.strip()}\".\n\n" + HELP_INDEX
+    )
+
 
 LIQ_CONFIRM_WORDS = {"si", "sí", "ok", "confirmar", "dale"}
 LIQ_CANCEL_WORDS = {"no", "cancelar"}
 
-
-def set_pending_liquidation(phone: str, pending_id: str):
-    pending_liquidations[phone] = {
-        "pendingId": pending_id,
-        "expiresAt": time.time() + PENDING_LIQUIDATION_TTL,
-    }
-
-
-def get_pending_liquidation(phone: str) -> dict | None:
-    entry = pending_liquidations.get(phone)
-    if not entry:
-        return None
-    if time.time() > entry["expiresAt"]:
-        pending_liquidations.pop(phone, None)
-        return None
-    return entry
-
-
-def clear_pending_liquidation(phone: str):
-    pending_liquidations.pop(phone, None)
+# El estado de pendientes (movimiento, transferencia, liquidación) vive en el
+# backend, no en memoria del proceso: sobrevive restarts y no depende de que la
+# respuesta caiga en el mismo worker que originó la pregunta.
 
 
 ADELANTO_RE = re.compile(r"^/adelanto\b\s*(.*)$", re.IGNORECASE | re.DOTALL)
@@ -421,34 +606,30 @@ def handle_liquidar(phone: str, sid: str, body: str) -> str:
         code, msg = _extract_edge_error(e)
         mapped = _map_rrhh_error(code, msg, name)
         return mapped or ""
-    pending_id = result.get("pendingId")
-    if pending_id:
-        set_pending_liquidation(phone, pending_id)
     return result.get("message") or "Liquidación preparada. Respondé SI para confirmar o NO para cancelar."
 
 
-def handle_liquidation_confirmation(phone: str, body: str) -> str | None:
-    """Return reply text if consumed, None to let message follow normal flow."""
-    entry = get_pending_liquidation(phone)
-    if not entry:
-        return None
+def handle_liquidation_confirmation(phone: str, body: str, pending_liquidation: dict) -> str | None:
+    """Resuelve SI/NO contra una liquidación pendiente ya leída del backend.
+
+    Devuelve el texto de respuesta si consumió el mensaje, o None si el mensaje
+    no era una confirmación. En ese caso la liquidación NO se descarta: queda
+    viva hasta que el usuario la resuelva o expire sola en el backend.
+    """
     lower = (body or "").strip().lower()
     if lower in LIQ_CONFIRM_WORDS:
         confirm = True
     elif lower in LIQ_CANCEL_WORDS:
         confirm = False
     else:
-        clear_pending_liquidation(phone)
         return None
     try:
-        result = rrhh_confirm_liquidation(phone, entry["pendingId"], confirm)
+        result = rrhh_confirm_liquidation(phone, pending_liquidation["id"], confirm)
     except httpx.HTTPStatusError as e:
-        clear_pending_liquidation(phone)
         code, msg = _extract_edge_error(e)
         if code == "duplicate_origin_ref":
             return ""
         return _map_rrhh_error(code, msg) or ""
-    clear_pending_liquidation(phone)
     default = "✅ Liquidación confirmada." if confirm else "Liquidación cancelada."
     return result.get("message") or default
 
@@ -479,26 +660,19 @@ def handle_summary(phone: str) -> str:
     return "\n\n".join(sections)
 
 
-def is_command(text: str) -> str | None:
-    t = text.strip().lower()
-    if t in COMMAND_RESPONSES or t in DYNAMIC_COMMANDS:
-        return t
-    return None
+HELP_COMMANDS = ("/ayuda", "/help", "/start")
 
 
-def twilio_reply(text: str) -> str:
-    resp = MessagingResponse()
-    resp.message(text)
-    return str(resp)
+def split_command(text: str) -> tuple[str, str]:
+    """Separa "/ayuda cargar" en ("/ayuda", "cargar").
 
-
-def send_whatsapp(to: str, text: str):
-    """Send a WhatsApp message via Twilio REST API (for async replies)."""
-    twilio_client.messages.create(
-        from_=f"whatsapp:{TWILIO_WHATSAPP_NUMBER}",
-        to=f"whatsapp:{to}",
-        body=text,
-    )
+    Telegram agrega @nombre_del_bot al comando en grupos, así que se recorta.
+    """
+    stripped = (text or "").strip()
+    if not stripped.startswith("/"):
+        return "", ""
+    head, _, rest = stripped.partition(" ")
+    return head.split("@")[0].lower(), rest.strip()
 
 
 def format_amount(value) -> str:
@@ -652,7 +826,7 @@ def _build_menu_indexes(candidates: list, raw_name: str) -> dict:
     """Compute numeric menu indexes for pending selection.
 
     Shape: {varios, create (or None), skip, cancel, visible_count}.
-    Keeps handle_pending_reply and _check_pending in sync.
+    Mantiene sincronizados el armado del menú y su resolución.
     """
     visible_count = min(len(candidates or []), 5)
     next_idx = visible_count + 1
@@ -775,23 +949,66 @@ def _resolve_transfer_pending(phone: str, choice_num: int, pending_transfer: dic
     return format_transfer_reply(result)
 
 
-def _resolve_pending_choice(phone: str, body: str) -> str | None:
+def _cancel_pending_state(phone: str, pending_resp: dict) -> str:
+    """Cancela todo lo que esté pendiente para este teléfono.
+
+    Antes sólo intentaba el pendiente de movimiento: si lo único abierto era una
+    transferencia o una liquidación, el /cancelar caía al parser de Claude y se
+    interpretaba como un movimiento nuevo.
+    """
+    pending = pending_resp.get("pending")
+    pending_transfer = pending_resp.get("pendingTransfer") or pending_resp.get("pending_transfer")
+    pending_liquidation = pending_resp.get("pendingLiquidation")
+    cancelled = []
+
+    if pending:
+        try:
+            if confirm_pending(phone, {"kind": "cancel"}, pending_id=pending.get("id")).get("cancelled"):
+                cancelled.append("la selección de contraparte")
+        except httpx.HTTPStatusError:
+            log.exception("no se pudo cancelar el pendiente de movimiento")
+    if pending_transfer:
+        try:
+            if confirm_transfer_pending(phone, pending_transfer["id"], {"kind": "cancel"}).get("cancelled"):
+                cancelled.append("la transferencia")
+        except httpx.HTTPStatusError:
+            log.exception("no se pudo cancelar el pendiente de transferencia")
+    if pending_liquidation:
+        try:
+            if rrhh_confirm_liquidation(phone, pending_liquidation["id"], False).get("cancelled"):
+                cancelled.append("la liquidación")
+        except httpx.HTTPStatusError:
+            log.exception("no se pudo cancelar la liquidación pendiente")
+
+    if not cancelled:
+        return "No hay nada pendiente para cancelar."
+    return "Cancelé " + " y ".join(cancelled) + "."
+
+
+def _resolve_pending_choice(phone: str, body: str, state: dict | None = None) -> str | None:
     """Core pending-selection resolver. Returns plain reply text, or None if
-    the message does not resolve a pending selection."""
+    the message does not resolve a pending selection.
+
+    `state` permite reusar un list_pending ya leído y evitar un round trip extra.
+    """
     lower = (body or "").strip().lower()
-    if lower == "/cancelar":
-        # Try movement pending first, fallback to transfer pending
-        resp = confirm_pending(phone, {"kind": "cancel"})
-        if resp.get("cancelled"):
-            return "Selección cancelada."
-        return None
+    is_cancel = lower == "/cancelar"
 
-    selection = parse_pending_selection_reply(body)
-    if selection is None:
-        return None
-    choice_num, choice_note = selection
+    # parse_pending_selection_reply admite "3 con nota" -> (3, "con nota"), asi que
+    # cubre lo que hacia try_parse_numeric y ademas rescata la nota del usuario.
+    choice_num, choice_note = None, ""
+    if not is_cancel:
+        selection = parse_pending_selection_reply(body)
+        if selection is None:
+            return None
+        choice_num, choice_note = selection
 
-    pending_resp = list_pending(phone)
+    pending_resp = state if state is not None else list_pending(phone)
+
+    if is_cancel:
+        # Cancela seleccion, transferencia y liquidacion de una, no solo la seleccion.
+        return _cancel_pending_state(phone, pending_resp)
+
     pending = pending_resp.get("pending")
     pending_transfer = pending_resp.get("pendingTransfer") or pending_resp.get("pending_transfer")
     pending_comprobante = pending_resp.get("pendingComprobante") or pending_resp.get("pending_comprobante")
@@ -856,30 +1073,25 @@ def _resolve_pending_choice(phone: str, body: str) -> str | None:
     return None
 
 
-def handle_pending_reply(phone: str, body: str) -> str | None:
-    """Return twilio reply string if this message resolves a pending selection; else None."""
-    reply = _resolve_pending_choice(phone, body)
-    if reply is None:
-        return None
-    return twilio_reply(reply)
+LIQ_PENDING_REMINDER = (
+    "⚠️ Seguís con una liquidación esperando confirmación. "
+    "Respondé SI para confirmarla o NO para cancelarla."
+)
+
+
+def fetch_pending_state(phone: str) -> dict:
+    """Lee el estado de pendientes del backend. Nunca levanta: si falla, el
+    mensaje sigue el flujo normal en vez de morir."""
+    try:
+        return list_pending(phone) or {}
+    except httpx.HTTPStatusError:
+        log.exception("no se pudo leer el estado de pendientes")
+        return {}
 
 
 def process_message(phone: str, body: str, sid: str, media_bytes: bytes | None, media_mime: str | None):
-    """Core processing logic. Returns reply text string."""
+    """Registra UN movimiento (con o sin un adjunto). Devuelve el texto de respuesta."""
     log.info("process start | phone=%s body=%r mime=%s has_media=%s", phone, body[:80], media_mime, bool(media_bytes))
-
-    if media_bytes and is_audio_mime(media_mime):
-        log.info("transcribing audio (%d bytes, %s)", len(media_bytes), media_mime)
-        transcript = transcribe_audio(media_bytes, media_mime)
-        log.info("transcript: %r", transcript[:200] if transcript else "")
-        if not transcript:
-            return "No pude transcribir el audio. Mandalo otra vez o escribilo."
-        pending_reply_text = _check_pending(phone, transcript)
-        if pending_reply_text:
-            return pending_reply_text
-        body = f"{body} {transcript}".strip() if body else transcript
-        media_bytes = None
-        media_mime = None
 
     log.info("fetching catalog")
     catalog = fetch_catalog(phone)
@@ -959,128 +1171,221 @@ def process_message(phone: str, body: str, sid: str, media_bytes: bytes | None, 
     return reply
 
 
-def _check_pending(phone: str, text: str) -> str | None:
-    """Check if text resolves a pending selection. Returns reply text or None."""
-    return _resolve_pending_choice(phone, text)
+def handle_incoming(phone: str, body: str, sid: str, media_items: list[dict]) -> list[str]:
+    """Rutea un mensaje entrante y devuelve la lista de respuestas a enviar."""
+    audio_items = [m for m in media_items if is_audio_mime(m["mime"])]
+    doc_items = [m for m in media_items if not is_audio_mime(m["mime"])]
 
+    # El audio se transcribe y se suma al texto: de ahí en más es un mensaje de texto.
+    for item in audio_items:
+        log.info("transcribing audio (%d bytes, %s)", len(item["bytes"]), item["mime"])
+        transcript = transcribe_audio(item["bytes"], item["mime"])
+        log.info("transcript: %r", transcript[:200] if transcript else "")
+        if not transcript:
+            return ["No pude transcribir el audio. Mandalo otra vez o escribilo."]
+        body = f"{body} {transcript}".strip() if body else transcript
 
-def process_async(phone, body, sid, media_bytes, media_mime):
-    """Run processing in background thread, send reply via Twilio API."""
-    try:
-        reply_text = process_message(phone, body, sid, media_bytes, media_mime)
-        send_whatsapp(phone, reply_text)
-        log.info("async reply sent to %s", phone)
-    except httpx.HTTPStatusError as e:
-        code = e.response.status_code
-        if code == 403:
-            send_whatsapp(phone, "Número no autorizado.")
-            return
-        try:
-            detail = e.response.json().get("error") or e.response.text
-        except Exception:
-            detail = e.response.text
-        send_whatsapp(phone, f"Error ingest ({code}): {str(detail)[:300]}")
-    except json.JSONDecodeError:
-        send_whatsapp(phone, "Error interpretando el mensaje. Intentá de nuevo.")
-    except Exception as e:
-        log.exception("async processing error")
-        send_whatsapp(phone, f"Error: {str(e)[:400]}")
+    reminder = None
 
+    if body and not doc_items:
+        # El ruteo de comandos vive acá: Telegram no tiene respuesta síncrona,
+        # todo sale por la API desde el thread de procesamiento.
+        command, argument = split_command(body)
+        if command in HELP_COMMANDS:
+            return [build_help(argument)]
+        if command == "/adelanto":
+            return [handle_adelanto(phone, sid, body)]
+        if command == "/liquidar":
+            return [handle_liquidar(phone, sid, body)]
+        if command == "/resumen":
+            return [handle_summary(phone)]
+        if command and command != "/cancelar":
+            return [f"No conozco el comando {command}.\n\n{HELP_INDEX}"]
 
-@app.route("/webhook", methods=["POST"])
-def webhook():
-    phone = request.values.get("From", "").replace("whatsapp:", "")
-    body = (request.values.get("Body") or "").strip()
-    sid = request.values.get("MessageSid", "")
-    num_media = int(request.values.get("NumMedia", 0) or 0)
-    media_url = request.values.get("MediaUrl0") if num_media > 0 else None
-    media_mime = request.values.get("MediaContentType0") if num_media > 0 else None
-
-    log.info("webhook | phone=%s body=%r num_media=%d mime=%s", phone, body[:80] if body else "", num_media, media_mime)
-
-    try:
-        # Quick sync replies: pending selection or commands (no heavy processing)
-        if not media_url and body:
-            # Liquidation confirmation (si/no/ok/cancelar) if pendingId active
-            liq_reply = handle_liquidation_confirmation(phone, body)
+        state = fetch_pending_state(phone)
+        pending_liquidation = state.get("pendingLiquidation")
+        if pending_liquidation:
+            liq_reply = handle_liquidation_confirmation(phone, body, pending_liquidation)
             if liq_reply is not None:
-                if liq_reply == "":
-                    return "", 200
-                return twilio_reply(liq_reply)
+                return [liq_reply]
+            # No era SI/NO: la liquidación queda viva y se avisa al final.
+            reminder = LIQ_PENDING_REMINDER
 
-            lower_body = body.strip().lower()
-            if lower_body.startswith("/adelanto"):
-                reply = handle_adelanto(phone, sid, body)
-                if not reply:
-                    return "", 200
-                return twilio_reply(reply)
-            if lower_body.startswith("/liquidar"):
-                reply = handle_liquidar(phone, sid, body)
-                if not reply:
-                    return "", 200
-                return twilio_reply(reply)
+        resolved = _resolve_pending_choice(phone, body, state=state)
+        if resolved is not None:
+            return [resolved, reminder] if reminder else [resolved]
 
-            pending_reply = handle_pending_reply(phone, body)
-            if pending_reply is not None:
-                return pending_reply
+    if not body and not doc_items:
+        return ["Mensaje vacío. Escribí /ayuda."]
 
-            cmd = is_command(body)
-            if cmd:
-                if cmd in COMMAND_RESPONSES:
-                    return twilio_reply(COMMAND_RESPONSES[cmd])
-                if cmd == "/resumen":
-                    return twilio_reply(handle_summary(phone))
+    if not doc_items:
+        replies = [process_message(phone, body, sid, None, None)]
+    else:
+        # Cada adjunto es un comprobante distinto → un movimiento por adjunto.
+        # El texto acompaña sólo al primero para no duplicar monto/nota en todos.
+        # El originRef se sufija para que el dedupe del backend no los colapse.
+        replies = [
+            process_message(
+                phone,
+                body if i == 0 else "",
+                sid if i == 0 else f"{sid}-{i}",
+                item["bytes"],
+                item["mime"],
+            )
+            for i, item in enumerate(doc_items)
+        ]
 
-        if not body and not media_url:
-            return twilio_reply("Mensaje vacío. Escribí /ayuda.")
+    if reminder:
+        replies.append(reminder)
+    return replies
 
-        # Download media if present
-        media_bytes = None
-        if media_url:
-            log.info("downloading media from %s", media_url)
-            r = httpx.get(media_url, auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN), timeout=30, follow_redirects=True)
-            r.raise_for_status()
-            media_bytes = r.content
-            log.info("media downloaded: %d bytes", len(media_bytes))
 
-        # Heavy processing → async (audio transcription, vision, etc.)
-        # Keeps Twilio from timing out; reply sent via REST API
-        needs_async = (media_bytes and is_audio_mime(media_mime)) or media_bytes is not None
-        if needs_async:
-            log.info("heavy processing detected (audio=%s, media=%s), going async",
-                     is_audio_mime(media_mime) if media_mime else False, bool(media_bytes))
-            threading.Thread(
-                target=process_async,
-                args=(phone, body, sid, media_bytes, media_mime),
-                daemon=True,
-            ).start()
-            return "", 200
+def user_facing_http_error(e: httpx.HTTPStatusError) -> str:
+    """Traduce un error del backend a algo que le sirva al usuario.
 
-        # Text-only — process synchronously
-        reply_text = process_message(phone, body, sid, media_bytes, media_mime)
-        return twilio_reply(reply_text)
+    El detalle crudo (que expone internals de Supabase) va al log, no al chat.
+    """
+    code = e.response.status_code
+    try:
+        detail = e.response.json().get("error") or e.response.text
+    except Exception:
+        detail = e.response.text
+    log.error("error del backend %s: %s", code, str(detail)[:500])
+    if code == 403:
+        return "Remitente no autorizado."
+    if EXPOSE_ERROR_DETAIL:
+        return f"Error ({code}): {str(detail)[:300]}"
+    return "No pude registrar el movimiento. Quedó el error en el log; probá de nuevo en un momento."
 
-    except httpx.HTTPStatusError as e:
-        code = e.response.status_code
-        log.error("HTTP error %d: %s", code, e.response.text[:300])
-        if code == 403:
-            return twilio_reply("Número no autorizado.")
+
+def process_async(channel, phone: str, body: str, sid: str, media_refs: list[dict]):
+    """Procesa en background y responde por el canal que trajo el mensaje.
+
+    `channel` es telegram_api o twilio_api: sólo se le piden `download_media` y
+    `send_message`, que ambos exponen igual. De ahí para abajo la lógica no sabe
+    por dónde entró el mensaje.
+
+    Va en un thread por los dos canales: Twilio corta a los 15s, y Telegram
+    reintenta el update si el webhook no contesta 200 rápido —lo que duplicaría
+    el movimiento—. Se contesta al toque y el trabajo real ocurre acá.
+    """
+    replies: list[str] = []
+    try:
         try:
-            detail = e.response.json().get("error") or e.response.text
-        except Exception:
-            detail = e.response.text
-        return twilio_reply(f"Error ingest ({code}): {str(detail)[:300]}")
+            media_items = channel.download_media(media_refs)
+        except httpx.HTTPError:
+            log.exception("no se pudieron descargar los adjuntos")
+            replies = ["No pude descargar el adjunto. Mandalo de nuevo."]
+        else:
+            replies = handle_incoming(phone, body, sid, media_items)
+    except httpx.HTTPStatusError as e:
+        replies = [user_facing_http_error(e)]
     except json.JSONDecodeError:
-        log.exception("JSON decode error")
-        return twilio_reply("Error interpretando el mensaje. Intentá de nuevo.")
-    except Exception as e:
-        log.exception("webhook error")
-        return twilio_reply(f"Error: {str(e)[:400]}")
+        log.exception("respuesta del parser ilegible")
+        replies = ["No pude interpretar el mensaje. Escribilo de otra forma."]
+    except Exception:
+        log.exception("async processing error")
+        replies = ["Hubo un error procesando el mensaje. Probá de nuevo en un momento."]
+
+    sent = 0
+    for reply in replies:
+        if not reply:
+            continue
+        channel.send_message(phone, reply)
+        sent += 1
+    log.info("async reply sent to %s (%d mensajes)", phone, sent)
+
+
+def _dispatch(channel, sender: str, body: str, ref: str, media_refs: list[dict]):
+    threading.Thread(
+        target=process_async,
+        args=(channel, sender, body, ref, media_refs),
+        daemon=True,
+    ).start()
+
+
+@app.route("/webhook/telegram", methods=["POST"])
+def webhook_telegram():
+    if not telegram_api.valid_secret(request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")):
+        log.warning("secret token inválido | ip=%s", request.remote_addr)
+        return "", 403
+
+    message = telegram_api.extract_message(request.get_json(silent=True) or {})
+    if not message:
+        # Joins, callbacks, ediciones de otros tipos: nada que procesar.
+        return "", 200
+
+    chat_id = telegram_api.chat_id_of(message)
+    if not chat_id:
+        return "", 200
+
+    body = telegram_api.extract_text(message)
+    media_refs = telegram_api.extract_media_refs(message)
+    log.info("telegram | chat_id=%s body=%r media=%d", chat_id, body[:80], len(media_refs))
+
+    _dispatch(telegram_api, chat_id, body, telegram_api.message_ref(message), media_refs)
+
+    # Siempre 200: un no-200 hace que Telegram reintente el update y duplique el
+    # movimiento. Los errores se le informan al usuario desde process_async.
+    return "", 200
+
+
+# Se mantiene en /webhook (y no en /webhook/twilio) porque es la URL que ya está
+# cargada en la consola de Twilio: moverla obligaría a reconfigurarla.
+@app.route("/webhook", methods=["POST"])
+def webhook_twilio():
+    if not twilio_api.enabled():
+        log.warning("llegó un webhook de Twilio con el canal apagado")
+        return "", 503
+    if not twilio_api.valid_signature():
+        log.warning(
+            "firma de Twilio inválida | ip=%s url=%s",
+            request.remote_addr,
+            twilio_api.public_request_url(),
+        )
+        return "", 403
+
+    phone = twilio_api.sender_of()
+    body = twilio_api.extract_text()
+    total_media = twilio_api.num_media()
+    media_refs, truncated = twilio_api.extract_media_refs(total_media)
+    log.info("twilio | phone=%s body=%r media=%d", phone, body[:80], len(media_refs))
+
+    if truncated:
+        log.warning(
+            "mensaje con %d adjuntos, se procesan los primeros %d",
+            total_media,
+            twilio_api.MAX_MEDIA_PER_MESSAGE,
+        )
+        twilio_api.send_message(
+            phone,
+            f"Recibí {total_media} adjuntos y proceso los primeros "
+            f"{twilio_api.MAX_MEDIA_PER_MESSAGE}. Mandá el resto en otro mensaje.",
+        )
+
+    _dispatch(twilio_api, phone, body, twilio_api.message_ref(), media_refs)
+    return "", 200
 
 
 @app.route("/", methods=["GET"])
 def health():
     return "Bot Finanzas OK", 200
+
+
+def publish_bot_commands():
+    """Sincroniza el menú de comandos al arrancar, en background.
+
+    En un thread para no bloquear el boot de gunicorn si Telegram no responde.
+    Sin TELEGRAM_BOT_TOKEN no hace ninguna llamada de red.
+    """
+    threading.Thread(
+        target=telegram_api.set_my_commands,
+        args=(BOT_COMMANDS,),
+        daemon=True,
+    ).start()
+
+
+publish_bot_commands()
 
 
 if __name__ == "__main__":
