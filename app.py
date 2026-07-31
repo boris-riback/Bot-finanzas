@@ -1233,8 +1233,18 @@ def _resolve_pending_choice(phone: str, body: str, state: dict | None = None) ->
             return format_duplicate_reply(result)
         comprobante_menu = format_comprobante_match_menu(result.get("comprobanteMatch"))
         if comprobante_menu:
+            # Con menú abierto no se manda el PDF: primero que resuelva la imputación.
             return f"{format_movement_reply(result)}\n\n{comprobante_menu}"
-        return format_movement_reply(result)
+
+        reply = format_movement_reply(result)
+        # Elegir la contraparte del menú es el caso que MAS recibos genera —el
+        # movimiento queda con proveedor identificado—, asi que el PDF va acá igual
+        # que en la carga directa.
+        if extract_receipt_info(result):
+            document = build_receipt_document(phone, movement_id=result.get("id"))
+            if document:
+                return [reply, document]
+        return reply
 
     if pending_comprobante:
         options = pending_comprobante.get("options") or []
@@ -1446,7 +1456,8 @@ def handle_incoming(phone: str, body: str, sid: str, media_items: list[dict]) ->
 
         resolved = _resolve_pending_choice(phone, body, state=state)
         if resolved is not None:
-            return [resolved, reminder] if reminder else [resolved]
+            # resolved puede traer [texto, documento] si el movimiento generó recibo.
+            return _flatten_replies([resolved, reminder] if reminder else [resolved])
 
     if not body and not doc_items:
         return ["Mensaje vacío. Escribí /ayuda."]
