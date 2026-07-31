@@ -26,6 +26,7 @@ from bialystok_client import (
     internal_transfer,
     list_pending,
     list_receipts,
+    receipt_pdf,
     request_cancel_movement,
     rrhh_advance,
     rrhh_confirm_liquidation,
