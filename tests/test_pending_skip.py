@@ -15,6 +15,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 import app
 from app import _resolve_pending_choice, format_movement_reply
+from conftest import make_prompt, pending_response
 
 
 CANDIDATES = [{"id": "a", "name": "Proveedor A"}, {"id": "b", "name": "Proveedor B"}]
@@ -36,7 +37,8 @@ def _install_pending(monkeypatch, raw_name="Proveedor X", candidates=None):
         "candidates": candidates if candidates is not None else CANDIDATES,
         "raw_counterparty_name": raw_name,
     }
-    monkeypatch.setattr(app, "list_pending", lambda phone: {"pending": pending_obj})
+    response = pending_response(make_prompt("counterparty", pending_obj))
+    monkeypatch.setattr(app, "list_pending", lambda phone: response)
 
 
 def test_skip_choice_sends_kind_skip(monkeypatch):

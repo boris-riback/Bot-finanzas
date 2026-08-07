@@ -19,6 +19,7 @@ from app import (
     format_transfer_reply,
     _resolve_pending_choice,
 )
+from conftest import make_prompt, pending_response
 
 
 def test_transfer_reply_happy_path():
@@ -81,7 +82,7 @@ def test_resolve_transfer_pending_select(monkeypatch):
         "candidates": [{"id": "cb-a", "name": "Banco A"}, {"id": "cb-b", "name": "Banco B"}],
         "unresolved_slot": "to",
     }
-    monkeypatch.setattr(app, "list_pending", lambda phone: {"pending": None, "pendingTransfer": pending_transfer})
+    monkeypatch.setattr(app, "list_pending", lambda phone: pending_response(make_prompt("transfer", pending_transfer)))
 
     calls = []
 
@@ -110,7 +111,7 @@ def test_resolve_transfer_pending_cancel(monkeypatch):
         "candidates": [{"id": "cb-a", "name": "A"}],
         "unresolved_slot": "from",
     }
-    monkeypatch.setattr(app, "list_pending", lambda phone: {"pending": None, "pendingTransfer": pending_transfer})
+    monkeypatch.setattr(app, "list_pending", lambda phone: pending_response(make_prompt("transfer", pending_transfer)))
 
     def fake_confirm_transfer(phone, pending_id, choice):
         return {"cancelled": True}
@@ -128,15 +129,19 @@ def test_resolve_transfer_pending_invalid(monkeypatch):
         "candidates": [{"id": "cb-a", "name": "A"}],
         "unresolved_slot": "from",
     }
-    monkeypatch.setattr(app, "list_pending", lambda phone: {"pending": None, "pendingTransfer": pending_transfer})
+    monkeypatch.setattr(app, "list_pending", lambda phone: pending_response(make_prompt("transfer", pending_transfer)))
     monkeypatch.setattr(app, "confirm_transfer_pending", lambda *a, **kw: {})
 
     reply = _resolve_pending_choice("+5490", "99")
     assert "inválida" in reply.lower()
 
 
-def test_movement_pending_takes_precedence_over_transfer(monkeypatch):
-    """If both movement pending and transfer pending exist, movement wins."""
+def test_oldest_question_wins_over_table_order(monkeypatch):
+    """La respuesta va a la pregunta más vieja, sin importar de qué cola sea.
+
+    Antes ganaba siempre la de contraparte por estar chequeada primero: con una
+    transferencia preguntada antes, el número contestaba la pregunta equivocada.
+    """
     movement_pending = {
         "id": "mp-1",
         "candidates": [{"id": "cp-a", "name": "Proveedor A"}],
@@ -147,24 +152,28 @@ def test_movement_pending_takes_precedence_over_transfer(monkeypatch):
         "candidates": [{"id": "cb-a", "name": "Caja X"}],
         "unresolved_slot": "from",
     }
-    monkeypatch.setattr(app, "list_pending", lambda phone: {"pending": movement_pending, "pendingTransfer": transfer_pending})
+    # La transferencia entró primero, así que es la que se responde.
+    monkeypatch.setattr(app, "list_pending", lambda phone: pending_response(
+        make_prompt("transfer", transfer_pending),
+        make_prompt("counterparty", movement_pending),
+    ))
 
-    calls = []
+    transfer_calls = []
 
-    def fake_confirm(phone, choice, pending_id=None):
-        calls.append({"choice": choice, "pending_id": pending_id})
-        return {"kind": "egreso", "amount": 100, "counterparty_name": "Proveedor A"}
+    def fake_confirm_transfer(phone, pending_id, choice):
+        transfer_calls.append({"pending_id": pending_id, "choice": choice})
+        return {"fromCashBoxName": "Caja X", "toCashBoxName": "Banco", "amount": 100}
 
-    monkeypatch.setattr(app, "confirm_pending", fake_confirm)
-    monkeypatch.setattr(app, "confirm_transfer_pending", lambda *a, **kw: {"fail": True})
+    monkeypatch.setattr(app, "confirm_transfer_pending", fake_confirm_transfer)
+    monkeypatch.setattr(app, "confirm_pending", lambda *a, **kw: {"fail": True})
 
     reply = _resolve_pending_choice("+5490", "1")
-    # Should have called confirm_pending (movement path) not confirm_transfer_pending
-    assert len(calls) == 1
-    assert calls[0]["choice"]["kind"] == "existing"
-    assert "EGRESO" in reply
+
+    assert len(transfer_calls) == 1
+    assert transfer_calls[0]["pending_id"] == "tp-1"
+    assert "TRANSFERENCIA" in reply
 
 
 def test_no_pending_returns_none(monkeypatch):
-    monkeypatch.setattr(app, "list_pending", lambda phone: {"pending": None, "pendingTransfer": None})
+    monkeypatch.setattr(app, "list_pending", lambda phone: pending_response())
     assert _resolve_pending_choice("+5490", "1") is None

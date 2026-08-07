@@ -918,11 +918,10 @@ def _format_comprobante_option(option: dict, idx: int) -> str:
     return f"{idx}. {format_amount(total)} → {', '.join(labels[:3])}"
 
 
-def format_comprobante_match_menu(match: dict | None) -> str:
-    if not isinstance(match, dict) or match.get("status") != "needs_comprobante_selection":
+def format_comprobante_options_menu(options: list) -> str:
+    visible = (options or [])[:5]
+    if not visible:
         return ""
-    options = match.get("options") or []
-    visible = options[:5]
     lines = ["Encontré varias formas de imputar este pago."]
     lines.append("")
     lines.append("¿Cuál corresponde? Respondé con el número:")
@@ -930,6 +929,12 @@ def format_comprobante_match_menu(match: dict | None) -> str:
         lines.append(_format_comprobante_option(option, idx))
     lines.append(f"{len(visible) + 1}. No imputar ahora")
     return "\n".join(lines)
+
+
+def format_comprobante_match_menu(match: dict | None) -> str:
+    if not isinstance(match, dict) or match.get("status") != "needs_comprobante_selection":
+        return ""
+    return format_comprobante_options_menu(match.get("options") or [])
 
 
 def log_receipt(result: dict | None):
@@ -1081,6 +1086,81 @@ def format_candidate_menu(candidates: list, suggested_name: str, suggested_cbu: 
     return "\n".join(lines)
 
 
+def _pending_prompt_header(prompt: dict) -> str:
+    """Encabezado que identifica de qué movimiento es la pregunta.
+
+    Con varias cargas seguidas el usuario tiene varios menús en pantalla; sin
+    esto no sabe cuál está contestando (y la respuesta se aplicaba a la que el
+    bot tuviera más a mano).
+    """
+    total = int(prompt.get("total") or 0)
+    position = int(prompt.get("position") or 0)
+    subject = prompt.get("subject") or {}
+    bits = []
+    if total > 1 and position:
+        bits.append(f"Pregunta {position} de {total}")
+    amount = subject.get("amount")
+    detail = " · ".join(
+        part for part in [subject.get("counterpartyName"), format_amount(amount) if amount else None] if part
+    )
+    if detail:
+        bits.append(detail)
+    return f"📌 {' · '.join(bits)}" if bits else ""
+
+
+def format_pending_prompt(prompt: dict | None) -> str:
+    """Menú de la próxima pregunta abierta, según la cola del backend.
+
+    El backend manda una sola: la más vieja de las tres colas. Así siempre hay
+    exactamente una pregunta en juego, sin importar cuántos comprobantes se
+    hayan cargado seguidos.
+    """
+    if not isinstance(prompt, dict):
+        return ""
+    data = prompt.get("data") or {}
+    kind = prompt.get("kind")
+
+    if kind == "counterparty":
+        payload = data.get("payload") or {}
+        menu = format_candidate_menu(
+            data.get("candidates") or [],
+            data.get("raw_counterparty_name") or payload.get("counterpartyName") or "",
+            payload.get("counterpartyCbu") or "",
+            kind=payload.get("kind") or "egreso",
+        )
+    elif kind == "comprobante":
+        menu = format_comprobante_options_menu(data.get("options") or [])
+    elif kind == "transfer":
+        menu = format_transfer_candidate_menu(
+            data.get("candidates") or [],
+            data.get("raw_name") or "",
+            data.get("unresolved_slot") or "from",
+        )
+    else:
+        return ""
+
+    if not menu:
+        return ""
+    header = _pending_prompt_header(prompt)
+    return f"{header}\n{menu}" if header else menu
+
+
+def with_next_prompt(reply, result: dict | None):
+    """Encadena el menú de la siguiente pregunta al reply de la que se resolvió.
+
+    El reply puede venir como lista [texto, documento] cuando además se manda el
+    PDF del recibo: el menú se suma al texto, no como mensaje aparte.
+    """
+    menu = format_pending_prompt((result or {}).get("nextPending"))
+    if not menu:
+        return reply
+    if isinstance(reply, list):
+        if not reply:
+            return [menu]
+        return [f"{reply[0]}\n\n{menu}", *reply[1:]]
+    return f"{reply}\n\n{menu}"
+
+
 NUMERIC_REPLY = re.compile(r"^\s*(\d+)\s*$")
 SELECTION_REPLY = re.compile(r"^\s*(\d+)(?:[\s\.\)\]:;\-]+(?P<note>.*))?\s*$", re.DOTALL)
 NOTE_PREFIX_RE = re.compile(r"^(?:nota|notas|obs|observacion|observación|comentario)\s*[:=\-]?\s*", re.IGNORECASE)
@@ -1122,12 +1202,12 @@ def _resolve_transfer_pending(phone: str, choice_num: int, pending_transfer: dic
     elif choice_num == cancel_idx:
         result = confirm_transfer_pending(phone, pending_transfer["id"], {"kind": "cancel"})
         if result.get("cancelled"):
-            return "Transferencia cancelada."
+            return with_next_prompt("Transferencia cancelada.", result)
         return "No pude cancelar."
     else:
         return "Opción inválida. Respondé con un número del menú o /cancelar."
 
-    return format_transfer_reply(result)
+    return with_next_prompt(format_transfer_reply(result), result)
 
 
 def _cancel_pending_state(phone: str, pending_resp: dict) -> str:
@@ -1173,6 +1253,68 @@ def _cancel_pending_state(phone: str, pending_resp: dict) -> str:
     return "Cancelé " + " y ".join(cancelled) + "."
 
 
+def _resolve_counterparty_pending(phone: str, choice_num: int, choice_note: str, pending: dict):
+    """Resuelve una respuesta numérica contra una pregunta de contraparte."""
+    candidates = pending.get("candidates") or []
+    raw_name = pending.get("raw_counterparty_name") or ""
+    idx = _build_menu_indexes(candidates, raw_name)
+    visible = candidates[: idx["visible_count"]]
+    pending_id = pending["id"]
+
+    if 1 <= choice_num <= idx["visible_count"]:
+        cp = visible[choice_num - 1]
+        result = confirm_pending(
+            phone,
+            with_optional_note({"kind": "existing", "counterpartyId": cp["id"]}, choice_note),
+            pending_id=pending_id,
+        )
+    elif choice_num == idx["varios"]:
+        result = confirm_pending(phone, with_optional_note({"kind": "varios"}, choice_note), pending_id=pending_id)
+    elif idx["create"] and choice_num == idx["create"]:
+        result = confirm_pending(phone, with_optional_note({"kind": "new", "name": raw_name}, choice_note), pending_id=pending_id)
+    elif choice_num == idx["skip"]:
+        result = confirm_pending(phone, with_optional_note({"kind": "skip"}, choice_note), pending_id=pending_id)
+    elif choice_num == idx["cancel"]:
+        result = confirm_pending(phone, {"kind": "cancel"}, pending_id=pending_id)
+        if result.get("cancelled"):
+            return with_next_prompt("Selección cancelada.", result)
+        return "No pude cancelar."
+    else:
+        return "Opción inválida. Respondé con un número del menú o /cancelar."
+
+    log_receipt(result)
+    if result.get("duplicated"):
+        return with_next_prompt(format_duplicate_reply(result), result)
+
+    reply = format_movement_reply(result)
+    # Elegir la contraparte del menú es el caso que MAS recibos genera —el
+    # movimiento queda con proveedor identificado—, asi que el PDF va acá igual
+    # que en la carga directa. Con otra pregunta esperando, el PDF igual sale:
+    # el menú que sigue viaja pegado al texto, no como mensaje aparte.
+    if extract_receipt_info(result):
+        document = build_receipt_document(phone, movement_id=result.get("id"))
+        if document:
+            return with_next_prompt([reply, document], result)
+    return with_next_prompt(reply, result)
+
+
+def _resolve_comprobante_pending(phone: str, choice_num: int, pending: dict):
+    """Resuelve una respuesta numérica contra una pregunta de imputación."""
+    options = pending.get("options") or []
+    skip_idx = min(len(options), 5) + 1
+    if 1 <= choice_num <= min(len(options), 5):
+        result = confirm_comprobante_pending(
+            phone,
+            pending["id"],
+            {"kind": "select", "optionIndex": choice_num},
+        )
+        return with_next_prompt(format_movement_reply(result), result)
+    if choice_num == skip_idx:
+        result = confirm_comprobante_pending(phone, pending["id"], {"kind": "skip"})
+        return with_next_prompt("Listo, no lo imputo ahora.", result)
+    return "Opción inválida. Respondé con un número del menú o /cancelar."
+
+
 def _resolve_pending_choice(phone: str, body: str, state: dict | None = None) -> str | None:
     """Core pending-selection resolver. Returns plain reply text, or None if
     the message does not resolve a pending selection.
@@ -1197,77 +1339,24 @@ def _resolve_pending_choice(phone: str, body: str, state: dict | None = None) ->
         # Cancela seleccion, transferencia y liquidacion de una, no solo la seleccion.
         return _cancel_pending_state(phone, pending_resp)
 
-    pending = pending_resp.get("pending")
-    pending_transfer = pending_resp.get("pendingTransfer") or pending_resp.get("pending_transfer")
-    pending_comprobante = pending_resp.get("pendingComprobante") or pending_resp.get("pending_comprobante")
+    # El backend decide QUÉ pregunta contesta este número: `next` es la más vieja
+    # de las tres colas. Elegirla acá por orden de tabla aplicaba la respuesta a
+    # la cola que se mirara primero, contestando en silencio por el comprobante
+    # equivocado cuando había más de uno abierto.
+    prompt = pending_resp.get("next")
+    if not isinstance(prompt, dict):
+        return None
+    pending = prompt.get("data") or {}
+    if not pending.get("id"):
+        return None
 
-    if pending:
-        candidates = pending.get("candidates") or []
-        raw_name = pending.get("raw_counterparty_name") or ""
-        idx = _build_menu_indexes(candidates, raw_name)
-        visible = candidates[: idx["visible_count"]]
-
-        if 1 <= choice_num <= idx["visible_count"]:
-            cp = visible[choice_num - 1]
-            result = confirm_pending(
-                phone,
-                with_optional_note({"kind": "existing", "counterpartyId": cp["id"]}, choice_note),
-                pending_id=pending["id"],
-            )
-        elif choice_num == idx["varios"]:
-            result = confirm_pending(phone, with_optional_note({"kind": "varios"}, choice_note), pending_id=pending["id"])
-        elif idx["create"] and choice_num == idx["create"]:
-            result = confirm_pending(phone, with_optional_note({"kind": "new", "name": raw_name}, choice_note), pending_id=pending["id"])
-        elif choice_num == idx["skip"]:
-            result = confirm_pending(phone, with_optional_note({"kind": "skip"}, choice_note), pending_id=pending["id"])
-        elif choice_num == idx["cancel"]:
-            result = confirm_pending(phone, {"kind": "cancel"}, pending_id=pending["id"])
-            if result.get("cancelled"):
-                return "Selección cancelada."
-            return "No pude cancelar."
-        else:
-            return "Opción inválida. Respondé con un número del menú o /cancelar."
-
-        log_receipt(result)
-        if result.get("duplicated"):
-            return format_duplicate_reply(result)
-        comprobante_menu = format_comprobante_match_menu(result.get("comprobanteMatch"))
-        if comprobante_menu:
-            # Con menú abierto no se manda el PDF: primero que resuelva la imputación.
-            return f"{format_movement_reply(result)}\n\n{comprobante_menu}"
-
-        reply = format_movement_reply(result)
-        # Elegir la contraparte del menú es el caso que MAS recibos genera —el
-        # movimiento queda con proveedor identificado—, asi que el PDF va acá igual
-        # que en la carga directa.
-        if extract_receipt_info(result):
-            document = build_receipt_document(phone, movement_id=result.get("id"))
-            if document:
-                return [reply, document]
-        return reply
-
-    if pending_comprobante:
-        options = pending_comprobante.get("options") or []
-        skip_idx = min(len(options), 5) + 1
-        if 1 <= choice_num <= min(len(options), 5):
-            result = confirm_comprobante_pending(
-                phone,
-                pending_comprobante["id"],
-                {"kind": "select", "optionIndex": choice_num},
-            )
-            return format_movement_reply(result)
-        if choice_num == skip_idx:
-            confirm_comprobante_pending(
-                phone,
-                pending_comprobante["id"],
-                {"kind": "skip"},
-            )
-            return "Listo, no lo imputo ahora."
-        return "Opción inválida. Respondé con un número del menú o /cancelar."
-
-    if pending_transfer:
-        return _resolve_transfer_pending(phone, choice_num, pending_transfer)
-
+    kind = prompt.get("kind")
+    if kind == "counterparty":
+        return _resolve_counterparty_pending(phone, choice_num, choice_note, pending)
+    if kind == "comprobante":
+        return _resolve_comprobante_pending(phone, choice_num, pending)
+    if kind == "transfer":
+        return _resolve_transfer_pending(phone, choice_num, pending)
     return None
 
 
@@ -1327,7 +1416,7 @@ def process_message(phone: str, body: str, sid: str, media_bytes: bytes | None, 
         )
         log.info("internal_transfer result: %s", json.dumps(result, ensure_ascii=False)[:300])
         if result.get("status") == "needs_selection_transfer":
-            menu = format_transfer_candidate_menu(
+            menu = format_pending_prompt(result.get("nextPending")) or format_transfer_candidate_menu(
                 result.get("candidates") or [],
                 result.get("rawName") or "",
                 result.get("unresolvedSlot") or "from",
@@ -1353,8 +1442,13 @@ def process_message(phone: str, body: str, sid: str, media_bytes: bytes | None, 
     log.info("ingest result: %s", json.dumps(result, ensure_ascii=False)[:300])
     log_receipt(result)
 
+    # El menú que se muestra es el de `nextPending`: si quedaban preguntas de
+    # cargas anteriores sin contestar, primero van esas. El encabezado dice de
+    # cuál de los movimientos es, así el usuario sabe qué está respondiendo.
+    queued_menu = format_pending_prompt(result.get("nextPending"))
+
     if result.get("status") == "needs_selection":
-        menu = format_candidate_menu(
+        menu = queued_menu or format_candidate_menu(
             result.get("candidates") or [],
             result.get("suggestedName") or "",
             result.get("suggestedCbu") or "",
@@ -1368,9 +1462,9 @@ def process_message(phone: str, body: str, sid: str, media_bytes: bytes | None, 
         add_to_history(phone, "bot", dup_reply)
         return dup_reply
 
-    comprobante_menu = format_comprobante_match_menu(result.get("comprobanteMatch"))
-    if comprobante_menu:
-        reply = f"{format_movement_reply(result, parsed)}\n\n{comprobante_menu}"
+    menu = queued_menu or format_comprobante_match_menu(result.get("comprobanteMatch"))
+    if menu:
+        reply = f"{format_movement_reply(result, parsed)}\n\n{menu}"
         add_to_history(phone, "bot", reply)
         # Con menú abierto no se manda el PDF: primero que resuelva la imputación.
         return reply
