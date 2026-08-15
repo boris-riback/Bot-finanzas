@@ -268,6 +268,8 @@ def build_prompt_text(catalog: dict, body: str, has_attachment: bool, phone: str
         "- counterpartyId: devolvé null salvo que el nombre coincida EXACTAMENTE con uno del catálogo. Si hay duda, null y poné el nombre crudo en counterpartyName.\n"
         '- Si el usuario dice "varios" o "proveedor varios" en el TEXTO, poné counterpartyName: "varios". Pero si "VARIOS" aparece solo en el comprobante como referencia/leyenda bancaria, NO es el proveedor — dejá counterpartyName en null.\n'
         '- Si no se menciona método de pago, usá "Efectivo".\n'
+        "- paymentMethods puede tener VARIAS entradas con el mismo name y distinta cashBoxName (ej dos 'Transferencia', una con cashBoxName 'Galicia' y otra 'Mercadopago'). Elegí la fila por el banco o billetera del comprobante: logo o encabezado de Banco Galicia → la de cashBoxName 'Galicia', logo de Mercado Pago → 'Mercadopago', y así. El paymentMethodId define la caja del movimiento: la fila equivocada manda la plata a la caja equivocada.\n"
+        "- Si el name del método se repite y el comprobante no dice de qué banco o billetera es, elegí la primera del catálogo.\n"
         "- NUNCA inventes UUIDs que no estén en el catálogo.\n"
         "- NUNCA inventes o adivines clasificación, concepto, o tipo de movimiento. Si el usuario o el comprobante no dicen explícitamente de qué rubro/categoría se trata, usá los valores más genéricos del catálogo (ej: la primera clasificación y concepto disponibles). NO intentes deducir el rubro a partir del tipo de comprobante.\n"
         "- notes: SOLO texto que el usuario escribió como observación libre. Disparadores: \"nota:\", \"obs:\", \"porque\", \"para\", \"es por\", \"corresponde a\", frases entre paréntesis.\n"
@@ -284,6 +286,11 @@ def build_prompt_text(catalog: dict, body: str, has_attachment: bool, phone: str
         '- "otro": no se puede determinar, o el adjunto no es ninguna de las dos cosas.\n'
         "- Es la distinción más importante del documento: una factura impaga es una deuda, un pago es plata que ya salió.\n"
         "- Sin adjunto (el usuario escribió el movimiento a mano) devolvé \"pago\": está contando plata que se movió.\n\n"
+        "Reglas de documentos de varias hojas:\n"
+        "- Una factura argentina suele venir impresa 2 o 3 veces en el mismo archivo: ORIGINAL, DUPLICADO y TRIPLICADO. Se reconocen porque repiten el MISMO número de comprobante, el mismo CAE/CAI y el mismo total, y suelen decir esa palabra en el encabezado o al pie.\n"
+        "- En ese caso es UNA SOLA factura: leé una hoja y devolvé sus valores tal cual. NO sumes entre hojas el total, ni las líneas de IVA, ni las percepciones — sumarlas duplica o triplica el gasto.\n"
+        "- Una factura larga tambien puede seguir en la hoja siguiente (mismo número, el detalle continúa y el total está al final). Ahí el total es el de la última hoja, no la suma de los subtotales.\n"
+        "- Si el archivo tiene DOS comprobantes DISTINTOS (distinto número o distinto CAE), no elijas uno: devolvé {\"error\": \"El archivo tiene más de un comprobante. Mandá uno por vez.\"}. Solo se puede cargar un movimiento por archivo.\n\n"
         "Reglas del IVA (taxVatLines, taxOtherAmount):\n"
         "- Sólo de facturas con IVA DISCRIMINADO (típico de Factura A). Si no está discriminado, taxVatLines = [] y taxOtherAmount = 0.\n"
         "- Una factura puede mezclar alícuotas: una línea por cada una, ej [{\"rate\": 21, \"amount\": 21000}, {\"rate\": 10.5, \"amount\": 5250}].\n"
