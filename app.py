@@ -176,6 +176,8 @@ def build_prompt_text(catalog: dict, body: str, has_attachment: bool, phone: str
             "- número de cheque / eCheq si aparece (chequeNumber)\n"
             "- método de pago si está indicado\n"
             "- datos de contacto de la contraparte: CUIT, mail, teléfono, condición frente al IVA, domicilio\n"
+            "- qué clase de papel es (documentKind): una factura o la constancia de un pago\n"
+            "- IVA discriminado por alícuota y percepciones, si la factura los muestra\n"
         )
 
     body_instruction = ""
@@ -228,6 +230,7 @@ def build_prompt_text(catalog: dict, body: str, has_attachment: bool, phone: str
         "Si es egreso o ingreso, devolvé JSON con estos campos:\n"
         "{\n"
         '  "kind": "egreso" | "ingreso",\n'
+        '  "documentKind": "factura" | "pago" | "otro",\n'
         '  "classificationId": "<uuid del catálogo>",\n'
         '  "classificationName": "<nombre legible de la clasificación elegida>",\n'
         '  "conceptId": "<uuid del catálogo>",\n'
@@ -254,6 +257,8 @@ def build_prompt_text(catalog: dict, body: str, has_attachment: bool, phone: str
         '  "receiptTypeId": "<uuid o null>",\n'
         '  "receiptNumber": "<string o null>",\n'
         '  "chequeNumber": "<string o null — solo si el adjunto es un cheque/eCheq>",\n'
+        '  "taxVatLines": [{"rate": 21, "amount": 12345.67}],\n'
+        '  "taxOtherAmount": <suma de percepciones/retenciones/impuestos que NO son IVA, 0 si no hay>,\n'
         '  "notes": "<observación libre del usuario, null si no hay>"\n'
         "}\n\n"
         "Reglas generales:\n"
@@ -269,6 +274,23 @@ def build_prompt_text(catalog: dict, body: str, has_attachment: bool, phone: str
         "- notes NUNCA debe contener datos extraídos del comprobante: CUIT, razón social, detalle de items/artículos, CAE, número de cuenta, banco, CBU, domicilio, etc. Si el usuario no escribió ninguna observación, notes = null.\n"
         "- Si el usuario dice p.ej. \"egreso 5000 a test por el evento de junio\", notes debe ser \"por el evento de junio\" (NO inventes, solo copiá literal lo relevante).\n"
         '- Si algún campo obligatorio no puede inferirse, respondé con un objeto {"error": "motivo"} en lugar del JSON de movimiento.\n\n'
+        "Reglas de documentKind — qué clase de papel es. Se distinguen a simple vista:\n"
+        '- "factura": el papel que documenta la OBLIGACIÓN. Señales: letra A/B/C/M en grande, CAE o CAI con vencimiento,\n'
+        "  número con formato 0001-00000001, punto de venta, detalle de productos o servicios, IVA discriminado,\n"
+        "  leyendas 'Factura', 'Nota de Crédito', 'Nota de Débito', 'Remito'. Todavía puede no estar pagada.\n"
+        '- "pago": el papel que documenta que la PLATA SE MOVIÓ. Señales: comprobante/constancia de transferencia,\n'
+        "  logo de banco o billetera, CBU/alias de origen y destino, número de operación o de trámite, 'Transferencia\n"
+        "  realizada', 'Pago exitoso', recibo de pago, ticket de POS, cheque o eCheq. NO tiene CAE ni letra de factura.\n"
+        '- "otro": no se puede determinar, o el adjunto no es ninguna de las dos cosas.\n'
+        "- Es la distinción más importante del documento: una factura impaga es una deuda, un pago es plata que ya salió.\n"
+        "- Sin adjunto (el usuario escribió el movimiento a mano) devolvé \"pago\": está contando plata que se movió.\n\n"
+        "Reglas del IVA (taxVatLines, taxOtherAmount):\n"
+        "- Sólo de facturas con IVA DISCRIMINADO (típico de Factura A). Si no está discriminado, taxVatLines = [] y taxOtherAmount = 0.\n"
+        "- Una factura puede mezclar alícuotas: una línea por cada una, ej [{\"rate\": 21, \"amount\": 21000}, {\"rate\": 10.5, \"amount\": 5250}].\n"
+        "- rate en puntos porcentuales (21, 10.5, 27, 0). amount es el MONTO DE IVA de esa alícuota, no el neto ni el total.\n"
+        "- NUNCA calcules el IVA vos: copiá los importes que están impresos. Si no están, taxVatLines = [].\n"
+        "- taxOtherAmount: percepciones de IIBB, percepción de IVA, impuestos internos, retenciones. Sumalos en un solo número.\n"
+        "- El total del comprobante (amount) es el TOTAL FINAL a pagar, con IVA e impuestos incluidos. No lo cambies por el neto.\n\n"
         "Reglas de los datos de contacto (counterpartyTaxId, Email, Phone, IvaCondition, Address):\n"
         "- Son SIEMPRE de la contraparte, NUNCA de la empresa que usa el sistema (ver 'Empresa propia' arriba).\n"
         "- En una factura de COMPRA (egreso) la contraparte es quien EMITE la factura; la empresa propia es quien la recibe.\n"

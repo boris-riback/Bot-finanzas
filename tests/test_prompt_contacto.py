@@ -77,6 +77,38 @@ def test_la_condicion_de_iva_no_se_deduce():
     assert "NO la deduzcas de la letra de la factura" in prompt
 
 
+def test_el_prompt_distingue_factura_de_pago():
+    prompt = app.build_prompt_text(CATALOG, "", has_attachment=True)
+
+    assert "documentKind" in prompt
+    # Las señales que separan una factura de una constancia de transferencia.
+    assert "CAE" in prompt
+    assert "número de operación" in prompt
+    assert "una factura impaga es una deuda" in prompt.lower()
+
+
+def test_sin_adjunto_el_movimiento_es_un_pago():
+    prompt = app.build_prompt_text(CATALOG, "MGB 5000 efectivo", has_attachment=False)
+
+    assert 'devolvé "pago"' in prompt
+
+
+def test_el_prompt_pide_el_iva_discriminado():
+    prompt = app.build_prompt_text(CATALOG, "", has_attachment=True)
+
+    assert "taxVatLines" in prompt
+    assert "taxOtherAmount" in prompt
+    # El riesgo es que invente el IVA en vez de copiarlo.
+    assert "NUNCA calcules el IVA" in prompt
+    assert "10.5" in prompt
+
+
+def test_el_total_sigue_siendo_el_total():
+    prompt = app.build_prompt_text(CATALOG, "", has_attachment=True)
+
+    assert "No lo cambies por el neto" in prompt
+
+
 def test_el_prompt_sigue_pidiendo_los_alias():
     # El aprendizaje de alias depende de este campo: si se cae, el importador
     # deja de aprender y vuelve a preguntar por el mismo proveedor siempre.
