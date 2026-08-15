@@ -137,6 +137,29 @@ def transcribe_audio(audio_bytes: bytes, mime: str) -> str:
     return (resp.text or "").strip()
 
 
+def build_own_company_block(organization: dict | None) -> str:
+    """Identidad de la empresa que usa el sistema, para el prompt.
+
+    Sin esto, en una factura de compra el modelo no tiene cómo saber cuál de los
+    dos CUIT es del proveedor y cuál es del que la recibió — y un CUIT cruzado
+    termina cargado en la ficha del proveedor.
+    """
+    if not organization:
+        return ""
+    fields = [
+        ("nombre", organization.get("name")),
+        ("razón social", organization.get("legalName")),
+        ("CUIT", organization.get("taxId")),
+    ]
+    known = [f"{label}: {value}" for label, value in fields if value]
+    if not known:
+        return ""
+    return (
+        "\nEmpresa propia (la que usa el sistema — NUNCA es la contraparte):\n"
+        + "".join(f"- {item}\n" for item in known)
+    )
+
+
 def build_prompt_text(catalog: dict, body: str, has_attachment: bool, phone: str = "") -> str:
     today = datetime.now().strftime("%Y-%m-%d")
     adjunto_block = ""
@@ -152,6 +175,7 @@ def build_prompt_text(catalog: dict, body: str, has_attachment: bool, phone: str
             "- tipo y número de comprobante (Factura A/B/C, Recibo, Ticket, Transferencia, etc.)\n"
             "- número de cheque / eCheq si aparece (chequeNumber)\n"
             "- método de pago si está indicado\n"
+            "- datos de contacto de la contraparte: CUIT, mail, teléfono, condición frente al IVA, domicilio\n"
         )
 
     body_instruction = ""
@@ -174,6 +198,7 @@ def build_prompt_text(catalog: dict, body: str, has_attachment: bool, phone: str
         f"- counterparties: {json.dumps(catalog.get('counterparties', []), ensure_ascii=False)}\n"
         f"- receiptTypes: {json.dumps(catalog.get('receiptTypes', []), ensure_ascii=False)}\n"
         f"- cashBoxes: {json.dumps(catalog.get('cashBoxes', []), ensure_ascii=False)}\n"
+        f"{build_own_company_block(catalog.get('organization'))}"
         f"{adjunto_block}"
         f"{body_instruction}\n"
         f"Fecha de hoy: {today}\n"
@@ -215,6 +240,11 @@ def build_prompt_text(catalog: dict, body: str, has_attachment: bool, phone: str
         '  "counterpartyName": "<nombre del proveedor que el usuario quiere asociar, null si no hay>",\n'
         '  "counterpartyAliasHints": ["otros nombres razón social vistos en el comprobante que no coinciden con counterpartyName"],\n'
         '  "counterpartyCbu": "<CBU o alias bancario del comprobante si aparece, null si no>",\n'
+        '  "counterpartyTaxId": "<CUIT/CUIL de la contraparte, solo dígitos. null si no aparece o si hay duda de quién es>",\n'
+        '  "counterpartyEmail": "<mail de la contraparte, null si no aparece>",\n'
+        '  "counterpartyPhone": "<teléfono de la contraparte, null si no aparece>",\n'
+        '  "counterpartyIvaCondition": "<condición frente al IVA de la contraparte TAL COMO ESTÁ ESCRITA en el comprobante, null si no está escrita>",\n'
+        '  "counterpartyAddress": "<domicilio de la contraparte, null si no aparece>",\n'
         '  "businessUnitId": "<uuid>",\n'
         '  "businessUnitName": "<nombre legible de la unidad de negocio>",\n'
         '  "amount": <number>,\n'
@@ -239,6 +269,15 @@ def build_prompt_text(catalog: dict, body: str, has_attachment: bool, phone: str
         "- notes NUNCA debe contener datos extraídos del comprobante: CUIT, razón social, detalle de items/artículos, CAE, número de cuenta, banco, CBU, domicilio, etc. Si el usuario no escribió ninguna observación, notes = null.\n"
         "- Si el usuario dice p.ej. \"egreso 5000 a test por el evento de junio\", notes debe ser \"por el evento de junio\" (NO inventes, solo copiá literal lo relevante).\n"
         '- Si algún campo obligatorio no puede inferirse, respondé con un objeto {"error": "motivo"} en lugar del JSON de movimiento.\n\n'
+        "Reglas de los datos de contacto (counterpartyTaxId, Email, Phone, IvaCondition, Address):\n"
+        "- Son SIEMPRE de la contraparte, NUNCA de la empresa que usa el sistema (ver 'Empresa propia' arriba).\n"
+        "- En una factura de COMPRA (egreso) la contraparte es quien EMITE la factura; la empresa propia es quien la recibe.\n"
+        "- En una factura de VENTA (ingreso) la contraparte es quien RECIBE la factura; la empresa propia es quien la emite.\n"
+        "- En una transferencia bancaria saliente la contraparte es el DESTINATARIO; en una entrante, el ORIGEN.\n"
+        "- Si el comprobante muestra dos CUIT y no podés determinar con certeza cuál es de la contraparte, devolvé null. Un dato en null no rompe nada; un dato cruzado ensucia la ficha del proveedor.\n"
+        "- Si un CUIT coincide con el de la empresa propia, ese NO es el de la contraparte: descartalo.\n"
+        "- counterpartyIvaCondition: sólo si está escrita en el comprobante ('IVA Responsable Inscripto', 'Monotributo', 'Exento', etc.). NO la deduzcas de la letra de la factura.\n"
+        "- counterpartyTaxId: sólo dígitos, sin guiones ni puntos.\n\n"
         "Reglas de lectura de comprobantes bancarios:\n"
         "- Cheque electrónico (eCheq) o cheque común:\n"
         "  * paymentMethod debe matchear el catálogo (variantes: 'Cheque', 'eCheq', 'Cheque Electrónico'). Si no hay match, usá el más cercano del catálogo paymentMethods.\n"
