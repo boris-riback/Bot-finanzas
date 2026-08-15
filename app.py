@@ -1,4 +1,5 @@
 import base64
+import hmac
 import io
 import json
 import logging
@@ -1710,6 +1711,63 @@ def webhook_twilio():
 
     _dispatch(twilio_api, phone, body, twilio_api.message_ref(), media_refs)
     return "", 200
+
+
+# Importador de la app: la app Android comparte un comprobante y necesita los
+# MISMOS datos que el bot extrae por WhatsApp. Este endpoint expone sólo el
+# cerebro (claude_parse) — recibe el catálogo ya resuelto y el archivo, y
+# devuelve el borrador. No carga nada, no conoce al usuario y no toca el
+# historial de la conversación: de la identidad y del guardado se ocupa la app
+# con la sesión del usuario. El intermediario que llama acá es la edge function
+# comprobante-import, que es la única que conoce APP_PARSE_TOKEN.
+APP_PARSE_TOKEN = os.environ.get("APP_PARSE_TOKEN", "")
+
+MAX_PARSE_BYTES = 15 * 1024 * 1024  # mismo techo que el bucket de comprobantes
+
+
+@app.route("/parse", methods=["POST"])
+def parse_document():
+    if not APP_PARSE_TOKEN:
+        log.warning("/parse llamado con APP_PARSE_TOKEN sin configurar")
+        return {"error": "El importador no está configurado."}, 503
+    if not hmac.compare_digest(request.headers.get("X-App-Token", ""), APP_PARSE_TOKEN):
+        log.warning("/parse con token inválido | ip=%s", request.remote_addr)
+        return {"error": "Token inválido."}, 401
+
+    payload = request.get_json(silent=True) or {}
+    catalog = payload.get("catalog")
+    if not isinstance(catalog, dict):
+        return {"error": "Falta el catálogo."}, 400
+
+    body = (payload.get("body") or "").strip()
+    mime = (payload.get("mime") or "").split(";")[0].strip().lower()
+    b64 = payload.get("base64") or ""
+
+    media_bytes = None
+    if b64:
+        if mime not in PDF_MIMES and mime not in IMAGE_MIMES:
+            return {"error": f"Tipo de archivo no soportado: {mime or 'desconocido'}."}, 400
+        try:
+            media_bytes = base64.b64decode(b64, validate=True)
+        except Exception:
+            return {"error": "El archivo no se pudo decodificar."}, 400
+        if len(media_bytes) > MAX_PARSE_BYTES:
+            return {"error": "El archivo supera el límite de 15 MB."}, 400
+    elif not body:
+        return {"error": "No hay ni archivo ni texto para interpretar."}, 400
+
+    log.info("/parse | mime=%s bytes=%d body=%r", mime, len(media_bytes or b""), body[:80])
+    try:
+        parsed = claude_parse(body, catalog, media_bytes, mime or None)
+    except json.JSONDecodeError:
+        log.exception("/parse | Claude devolvió algo que no es JSON")
+        return {"error": "No pude interpretar el comprobante."}, 502
+    except Exception:
+        log.exception("/parse | falló claude_parse")
+        return {"error": "No pude leer el comprobante."}, 502
+
+    log.info("/parse ok | %s", json.dumps(parsed, ensure_ascii=False)[:300])
+    return {"parsed": parsed}, 200
 
 
 @app.route("/", methods=["GET"])

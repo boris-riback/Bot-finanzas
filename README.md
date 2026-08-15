@@ -30,6 +30,7 @@ solo y `/webhook` empieza a devolver 503, sin tocar código.
 | `OPENAI_API_KEY` | API Key de OpenAI (transcripción de audios con Whisper) |
 | `BIALYSTOK_INGEST_URL` | URL de la Edge Function `whatsapp-bot-ingest` |
 | `BOT_INGEST_TOKEN` | Token compartido con la Edge Function (header `x-bot-token`) |
+| `APP_PARSE_TOKEN` | Token del endpoint `/parse` (header `X-App-Token`), que usa el importador de la app Android. Sin esta variable el endpoint devuelve 503 y el resto del bot sigue andando |
 | `VERIFY_WEBHOOK_SECRET` | `true` por defecto. Sólo poner `false` en desarrollo local |
 | `VERIFY_TWILIO_SIGNATURE` | `true` por defecto. Sólo poner `false` en desarrollo local |
 | `EXPOSE_ERROR_DETAIL` | `false` por defecto. `true` muestra el error crudo del backend en el chat |
@@ -70,12 +71,34 @@ canónico, así que **se comparten entre canales** — podés arrancar por Whats
 confirmar por Telegram. El historial de conversación, en cambio, vive en memoria
 del proceso indexado por el identificador crudo: **no se comparte**.
 
+## `/parse` — el lector, sin el bot
+
+La app Android también importa comprobantes: se comparte un PDF desde WhatsApp o
+Gmail hacia BialyApp y aparece cargado. Para no tener dos parsers que se
+despeguen, la app reusa **este** — el mismo prompt, el mismo modelo y las mismas
+reglas de eCheq y transferencia bancaria.
+
+```
+App Android (share sheet) → Edge Function comprobante-import → POST /parse
+                                     ↓                              ↓
+                          pantalla de confirmación ←──────── borrador (JSON)
+```
+
+`POST /parse` recibe `{catalog, base64, mime, body}` y devuelve `{parsed}`. Es
+puramente funcional: no conoce al remitente, no toca `bot_phone_map`, no escribe
+en el ERP y no deja historial de conversación. El catálogo se lo pasa la Edge
+Function ya resuelto, porque la identidad del usuario sale de su sesión en la app.
+
+Quien guarda es la app, con los permisos del usuario. El token de este endpoint
+nunca viaja en el APK: lo tiene la Edge Function.
+
 ## Seguridad de los webhooks
 
 | Ruta | Validación |
 |---|---|
 | `/webhook/telegram` | header `X-Telegram-Bot-Api-Secret-Token` vs `TELEGRAM_WEBHOOK_SECRET`, con `hmac.compare_digest` |
 | `/webhook` | firma `X-Twilio-Signature` sobre el form del request |
+| `/parse` | header `X-App-Token` vs `APP_PARSE_TOKEN`, con `hmac.compare_digest` |
 
 Sin eso, cualquiera que conozca la URL pública puede inyectar movimientos en el ERP.
 
