@@ -68,6 +68,17 @@ ZIP_MIMES = {
     "multipart/x-zip",
 }
 
+# Firma de un ZIP (PK\x03\x04). Se mira el contenido —y no sólo el mime— porque
+# hay clientes de Telegram que mandan el documento sin mime_type y el ref cae al
+# fallback octet-stream: ahí el paquete llegaba entero y no lo abría nadie. En el
+# mensaje no viene el nombre del archivo, así que la firma es lo único que queda.
+ZIP_MAGIC = b"PK\x03\x04"
+
+# Mimes que no dicen nada. Sólo con estos se mira la firma: un .xlsx o un .docx
+# también empiezan con PK y no son paquetes de comprobantes, pero llegan con su
+# propio mime declarado y no caen acá.
+UNKNOWN_MIMES = {"", "application/octet-stream", "binary/octet-stream"}
+
 # Techo de comprobantes por ZIP. Cada uno cuesta una llamada al parser y una
 # respuesta en el chat, así que una emisión enorme inundaría la conversación.
 MAX_ZIP_ENTRIES = 50
@@ -140,6 +151,18 @@ def is_zip_mime(mime: str | None) -> bool:
     return bool(mime) and mime.split(";")[0].strip().lower() in ZIP_MIMES
 
 
+def looks_like_zip(item: dict) -> bool:
+    """Si el adjunto es un ZIP, por lo que declara o por lo que es.
+
+    La firma se mira sólo cuando el mime no dice nada: si el cliente declaró un
+    tipo, se le cree.
+    """
+    mime = (item.get("mime") or "").split(";")[0].strip().lower()
+    if is_zip_mime(mime):
+        return True
+    return mime in UNKNOWN_MIMES and (item.get("bytes") or b"")[:4] == ZIP_MAGIC
+
+
 def _zip_comprobante_names(names: list[str]) -> list[str]:
     """De todos los nombres del ZIP, cuáles son los comprobantes a cargar.
 
@@ -187,7 +210,7 @@ def expand_zip_items(items: list[dict]) -> tuple[list[dict], list[str]]:
     notes: list[str] = []
 
     for item in items:
-        if not is_zip_mime(item.get("mime")):
+        if not looks_like_zip(item):
             expanded.append(item)
             continue
         try:
@@ -1662,6 +1685,32 @@ def _flatten_replies(items: list) -> list:
     return out
 
 
+def _process_doc_item(phone: str, body: str, sid: str, item: dict, position: str = "") -> str:
+    """Carga UN adjunto y devuelve su respuesta, sin dejar que su error tumbe a los demás.
+
+    Un mensaje puede traer varios comprobantes —hoy sobre todo el ZIP de una
+    emisión de e-cheqs, que se abre en un adjunto por cheque— y cada uno es una
+    llamada al parser y un movimiento aparte. Sin esto, que el cuarto fallara
+    perdía los que faltaban y dejaba al usuario con un error genérico, sin saber
+    cuáles habían entrado.
+
+    `position` es "3 de 8" cuando hay varios, para que el aviso diga cuál falló.
+    """
+    subject = f"el comprobante {position}" if position else "el comprobante"
+    retry = "Mandalo suelto." if position else "Probá de nuevo en un momento."
+    try:
+        return process_message(phone, body, sid, item["bytes"], item["mime"])
+    except httpx.HTTPStatusError as e:
+        log.exception("el backend rechazó %s", subject)
+        return f"Con {subject}: {user_facing_http_error(e)}"
+    except json.JSONDecodeError:
+        log.exception("respuesta del parser ilegible en %s", subject)
+        return f"No pude interpretar {subject}. {retry}"
+    except Exception:
+        log.exception("no se pudo cargar %s", subject)
+        return f"No pude cargar {subject}. {retry}"
+
+
 def handle_incoming(phone: str, body: str, sid: str, media_items: list[dict]) -> list[str]:
     """Rutea un mensaje entrante y devuelve la lista de respuestas a enviar."""
     # El ZIP del home banking se abre antes de repartir: adentro viene un
@@ -1735,12 +1784,12 @@ def handle_incoming(phone: str, body: str, sid: str, media_items: list[dict]) ->
         # El texto acompaña sólo al primero para no duplicar monto/nota en todos.
         # El originRef se sufija para que el dedupe del backend no los colapse.
         replies = [
-            process_message(
+            _process_doc_item(
                 phone,
                 body if i == 0 else "",
                 sid if i == 0 else f"{sid}-{i}",
-                item["bytes"],
-                item["mime"],
+                item,
+                f"{i + 1} de {len(doc_items)}" if len(doc_items) > 1 else "",
             )
             for i, item in enumerate(doc_items)
         ]

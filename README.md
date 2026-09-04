@@ -186,6 +186,14 @@ entraron uno por uno. La misma regla de selección corre en el ERP
 (`src/modules/finanzas/lib/comprobanteImport/bankZip.js`) para el share sheet de
 Android — el mismo ZIP tiene que entrar igual por los dos canales.
 
+Se reconoce por el mime y, cuando el cliente no declara ninguno (Telegram cae a
+`application/octet-stream` si el documento viene sin `mime_type`), por la firma
+`PK\x03\x04`. La firma se mira **sólo** con mime desconocido: un `.xlsx` también
+empieza con PK y llega con el suyo declarado.
+
+**Cada adjunto responde por sí mismo** (`_process_doc_item`): un error en el
+cuarto cheque de ocho informa cuál falló y no pierde los que faltan.
+
 ## Deploy en Render
 
 1. Push a GitHub

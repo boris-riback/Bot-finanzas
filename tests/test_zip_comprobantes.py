@@ -84,6 +84,30 @@ def test_los_adjuntos_que_no_son_zip_pasan_derecho():
     assert len(items) == 3
 
 
+def test_abre_el_zip_que_llega_sin_mime_declarado():
+    # Hay clientes de Telegram que mandan el documento sin mime_type y el ref cae
+    # al fallback octet-stream. Sin mirar la firma, el paquete pasaba de largo.
+    item = make_zip(GALICIA)
+    item["mime"] = "application/octet-stream"
+    items, notes = app.expand_zip_items([item])
+
+    assert notes == []
+    assert len(items) == 2
+
+
+def test_no_confunde_un_xlsx_con_un_zip():
+    # Un .xlsx tambien empieza con PK, pero llega con su mime declarado: se le
+    # cree y sigue de largo en vez de abrirse buscando comprobantes.
+    xlsx = {
+        "mime": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "bytes": make_zip({"xl/workbook.xml": b"<workbook/>"})["bytes"],
+    }
+    items, notes = app.expand_zip_items([xlsx])
+
+    assert items == [xlsx]
+    assert notes == []
+
+
 def test_avisa_cuando_el_zip_no_trae_comprobantes():
     items, notes = app.expand_zip_items([make_zip({"leeme.txt": b"nada"})])
 
@@ -106,3 +130,33 @@ def test_corta_una_emision_mas_grande_que_el_techo():
 
     assert items == []
     assert "máximo" in notes[0]
+
+
+def test_un_cheque_que_falla_no_se_lleva_puestos_a_los_demas(monkeypatch):
+    """El error de uno se informa y los otros siguen cargando.
+
+    Sin esto, una emisión de ocho cheques que se topaba con un error en el
+    cuarto perdía los cuatro que faltaban y contestaba un error genérico, sin
+    decir cuáles habían entrado.
+    """
+    llamadas = []
+
+    def process_message(phone, body, sid, media_bytes, media_mime):
+        llamadas.append(sid)
+        if media_bytes == b"%PDF cheque 270":
+            raise RuntimeError("el parser se cayó")
+        return f"cargado {media_bytes.decode()}"
+
+    monkeypatch.setattr(app, "process_message", process_message)
+    monkeypatch.setattr(app, "fetch_pending_state", lambda phone: {})
+
+    replies = app.handle_incoming("+549", "", "sid", [make_zip({
+        "detalles/Cheque269_A.pdf": b"%PDF cheque 269",
+        "detalles/Cheque270_B.pdf": b"%PDF cheque 270",
+        "detalles/Cheque271_C.pdf": b"%PDF cheque 271",
+    })])
+
+    assert len(llamadas) == 3
+    assert replies[0] == "cargado %PDF cheque 269"
+    assert "2 de 3" in replies[1]
+    assert replies[2] == "cargado %PDF cheque 271"
