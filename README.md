@@ -177,6 +177,15 @@ va intacto y encima llega el `mime_type` real.
 Telegram manda un update por archivo — un álbum llega como varios updates — así
 que cada adjunto genera su propio movimiento.
 
+**ZIP del home banking**: Banco Galicia entrega la emisión de e-cheqs comprimida,
+con un resumen en la raíz y un PDF por cheque en `detalles/`. `expand_zip_items`
+abre el paquete antes de repartir los adjuntos y deja un PDF por cheque, así que
+de ahí para abajo el bot no sabe que existió un ZIP. El resumen se descarta:
+cargarlo sumaría un pago por el total de la tanda encima de los cheques que ya
+entraron uno por uno. La misma regla de selección corre en el ERP
+(`src/modules/finanzas/lib/comprobanteImport/bankZip.js`) para el share sheet de
+Android — el mismo ZIP tiene que entrar igual por los dos canales.
+
 ## Deploy en Render
 
 1. Push a GitHub

@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import threading
+import zipfile
 from collections import defaultdict, deque
 from datetime import datetime
 
@@ -57,6 +58,19 @@ EXPOSE_ERROR_DETAIL = _env_flag("EXPOSE_ERROR_DETAIL", False)
 
 IMAGE_MIMES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
 PDF_MIMES = {"application/pdf"}
+
+# El ZIP que descarga el home banking. No lo lee el parser: se abre acá y cada
+# PDF de adentro sigue como un adjunto más (ver expand_zip_items).
+ZIP_MIMES = {
+    "application/zip",
+    "application/x-zip-compressed",
+    "application/x-zip",
+    "multipart/x-zip",
+}
+
+# Techo de comprobantes por ZIP. Cada uno cuesta una llamada al parser y una
+# respuesta en el chat, así que una emisión enorme inundaría la conversación.
+MAX_ZIP_ENTRIES = 50
 
 # Espejo del marcador que usa la app web (src/shared/lib/treasuryChecks.js)
 # para serializar el numero de cheque dentro de movements.notes. El backend
@@ -120,6 +134,81 @@ def get_history_text(phone: str) -> str:
 
 def is_audio_mime(mime: str | None) -> bool:
     return bool(mime) and mime.split(";")[0].strip().lower() in AUDIO_MIME_EXT
+
+
+def is_zip_mime(mime: str | None) -> bool:
+    return bool(mime) and mime.split(";")[0].strip().lower() in ZIP_MIMES
+
+
+def _zip_comprobante_names(names: list[str]) -> list[str]:
+    """De todos los nombres del ZIP, cuáles son los comprobantes a cargar.
+
+    Banco Galicia entrega la emisión de e-cheqs así:
+
+        Detalles_operacion_nroLR93D7Q164.pdf                  <- resumen
+        detalles/Cheque269_FIBO DE LUJAN..._33717856789.pdf    <- un cheque
+        detalles/Cheque270_...pdf                              <- otro cheque
+
+    El de la raíz es un resumen: repite la cantidad de cheques y el total. Si se
+    cargara entraría un pago por la suma de toda la tanda encima de los cheques
+    que ya entraron uno por uno. De ahí la regla: si hay PDF en subcarpeta, esos
+    son los comprobantes; si están todos en la raíz, son todos.
+
+    Espejo de selectComprobanteNames en el ERP
+    (src/modules/finanzas/lib/comprobanteImport/bankZip.js): el mismo ZIP tiene
+    que entrar igual por el chat y por el share de Android.
+    """
+    pdfs = [
+        name for name in names
+        if name.lower().endswith(".pdf")
+        and not name.startswith("__MACOSX/")
+        and not name.rsplit("/", 1)[-1].startswith(".")
+    ]
+    nested = [name for name in pdfs if "/" in name]
+    selected = nested or pdfs
+    # Orden natural: Cheque2 antes que Cheque10, como los lista el resumen.
+    return sorted(selected, key=lambda name: [
+        int(part) if part.isdigit() else part.lower()
+        for part in re.split(r"(\d+)", name.rsplit("/", 1)[-1])
+    ])
+
+
+def expand_zip_items(items: list[dict]) -> tuple[list[dict], list[str]]:
+    """Reemplaza cada ZIP por los comprobantes que trae adentro.
+
+    Devuelve (adjuntos, avisos). Los adjuntos que no son ZIP pasan derecho, así
+    que de acá para abajo el bot no sabe que existió un ZIP: cada cheque es un
+    adjunto más, y `handle_incoming` ya carga un movimiento por adjunto.
+
+    Un ZIP ilegible o vacío no rompe el mensaje: se avisa y los demás adjuntos
+    siguen su camino.
+    """
+    expanded: list[dict] = []
+    notes: list[str] = []
+
+    for item in items:
+        if not is_zip_mime(item.get("mime")):
+            expanded.append(item)
+            continue
+        try:
+            with zipfile.ZipFile(io.BytesIO(item["bytes"])) as archive:
+                names = _zip_comprobante_names(archive.namelist())
+                if not names:
+                    notes.append("El ZIP no tiene ningún comprobante en PDF adentro.")
+                    continue
+                if len(names) > MAX_ZIP_ENTRIES:
+                    notes.append(
+                        f"El ZIP trae {len(names)} comprobantes y el máximo es "
+                        f"{MAX_ZIP_ENTRIES}. Partilo en dos."
+                    )
+                    continue
+                log.info("zip con %d comprobantes", len(names))
+                expanded.extend({"mime": "application/pdf", "bytes": archive.read(name)} for name in names)
+        except (zipfile.BadZipFile, RuntimeError):
+            # RuntimeError es lo que tira zipfile cuando el ZIP pide contraseña.
+            notes.append("No pude abrir el ZIP. Puede estar dañado o tener contraseña.")
+
+    return expanded, notes
 
 
 def transcribe_audio(audio_bytes: bytes, mime: str) -> str:
@@ -440,6 +529,10 @@ HELP_TOPICS = {
         "\n"
         "Cheques y eCheq: detecto la fecha de vencimiento aparte de la de\n"
         "emisión. Si el cheque es a fecha futura queda como pendiente.\n"
+        "\n"
+        "ZIP del home banking: mandalo tal como lo bajás del banco. Abro el\n"
+        "paquete y cargo un movimiento por cheque; el resumen de la tanda no\n"
+        "lo cuento aparte.\n"
         "\n"
         "Audios: los transcribo y los trato como si los hubieras escrito.\n"
         "Sirve tanto para cargar un movimiento como para responder un menú.\n"
@@ -1571,6 +1664,12 @@ def _flatten_replies(items: list) -> list:
 
 def handle_incoming(phone: str, body: str, sid: str, media_items: list[dict]) -> list[str]:
     """Rutea un mensaje entrante y devuelve la lista de respuestas a enviar."""
+    # El ZIP del home banking se abre antes de repartir: adentro viene un
+    # comprobante por archivo, y el bot ya sabe cargar un movimiento por adjunto.
+    media_items, zip_notes = expand_zip_items(media_items)
+    if zip_notes and not media_items:
+        return zip_notes
+
     audio_items = [m for m in media_items if is_audio_mime(m["mime"])]
     doc_items = [m for m in media_items if not is_audio_mime(m["mime"])]
 
@@ -1649,6 +1748,7 @@ def handle_incoming(phone: str, body: str, sid: str, media_items: list[dict]) ->
 
     if reminder:
         replies.append(reminder)
+    replies.extend(zip_notes)
     return replies
 
 
